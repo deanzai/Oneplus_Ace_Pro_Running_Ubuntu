@@ -1,0 +1,202 @@
+diff --git a/drivers/input/touchscreen/synaptics_tcm.c b/drivers/input/touchscreen/synaptics_tcm.c
+index 7cd2c906e..93a2c22a4 100644
+--- a/drivers/input/touchscreen/synaptics_tcm.c
++++ b/drivers/input/touchscreen/synaptics_tcm.c
+@@ -25,6 +25,7 @@
+ 
+ #define TCM_OBJ_FINGER			1
+ #define TCM_OBJ_GLOVED			2
++#define TCM_STATUS_OK			0x01
+ 
+ static int synaptics_tcm_power_on(struct synaptics_tcm_core *ts)
+ {
+@@ -173,6 +174,57 @@ static int synaptics_tcm_continue_read(struct synaptics_tcm_core *ts, size_t len
+ 
+ }
+ 
++static int synaptics_tcm_read_cmd_resp(struct synaptics_tcm_core *ts,
++				       unsigned char cmd,
++				       struct synaptics_tcm_v1_message_header *header)
++{
++	int attempt, ret;
++
++	ret = synaptics_tcm_write_cmd(ts, cmd, NULL, 0);
++	if (ret) {
++		dev_warn(ts->dev, "cmd 0x%02x write failed: %d\n", cmd, ret);
++		return ret;
++	}
++
++	msleep(40);
++
++	for (attempt = 0; attempt < 8; attempt++) {
++		ret = synaptics_tcm_read_header(ts, (unsigned char *)header);
++		if (ret)
++			return ret;
++
++		if (header->marker == SYNAPTICS_TCM_V1_MESSAGE_MARKER &&
++		    header->code == TCM_STATUS_OK)
++			return 0;
++
++		if (header->marker == SYNAPTICS_TCM_V1_MESSAGE_MARKER &&
++		    header->code >= REPORT_IDENTIFY) {
++			unsigned int len = get_unaligned_le16(header->length);
++
++			if (len > 0 && len <= 4096) {
++				unsigned char *discard = kzalloc(len, GFP_KERNEL);
++
++				if (!discard)
++					return -ENOMEM;
++				ret = synaptics_tcm_continue_read(ts, len, discard);
++				kfree(discard);
++				if (ret)
++					return ret;
++			}
++			msleep(15);
++			continue;
++		}
++
++		dev_warn(ts->dev,
++			 "cmd 0x%02x unexpected response marker=0x%02x code=0x%02x\n",
++			 cmd, header->marker, header->code);
++		return -EIO;
++	}
++
++	dev_warn(ts->dev, "cmd 0x%02x timed out draining async reports\n", cmd);
++	return -ETIMEDOUT;
++}
++
+ static int synaptics_tcm_identify_chip(struct synaptics_tcm_core *ts)
+ {
+ 	int ret;
+@@ -181,6 +233,8 @@ static int synaptics_tcm_identify_chip(struct synaptics_tcm_core *ts)
+ 
+ 	unsigned char cmd = ts->use_hbp_mode ? 0x07 : 0x02;
+ 
++	memset(&chipid, 0, sizeof(chipid));
++
+ 	ret = synaptics_tcm_write_cmd(ts, cmd, NULL, 0);
+ 	if (ret) {
+ 		dev_err(ts->dev, "Failed to write identify cmd 0x%02x: %d\n",
+@@ -201,8 +255,19 @@ static int synaptics_tcm_identify_chip(struct synaptics_tcm_core *ts)
+ 	    header.code == REPORT_HBP_ACTIVE_FRAME) {
+ 		unsigned int len = get_unaligned_le16(header.length);
+ 
+-		ret = synaptics_tcm_continue_read(ts, len,
+-						  (unsigned char *)&chipid);
++		if (len > sizeof(chipid)) {
++			unsigned char *buf = kzalloc(len, GFP_KERNEL);
++
++			if (!buf)
++				return -ENOMEM;
++			ret = synaptics_tcm_continue_read(ts, len, buf);
++			if (!ret)
++				memcpy(&chipid, buf, sizeof(chipid));
++			kfree(buf);
++		} else if (len > 0) {
++			ret = synaptics_tcm_continue_read(ts, len,
++							  (unsigned char *)&chipid);
++		}
+ 		if (ret) {
+ 			dev_err(ts->dev, "Failed to read IDENTIFY payload: %d\n",
+ 				ret);
+@@ -223,15 +288,7 @@ static int synaptics_tcm_get_fw_config(struct synaptics_tcm_core *ts)
+ 	struct synaptics_tcm_v1_message_header header;
+ 	struct synaptics_tcm_application_info appinfo;
+ 
+-	ret = synaptics_tcm_write_cmd(ts, CMD_GET_APPLICATION_INFO, NULL, 0);
+-	if (ret) {
+-		dev_err(ts->dev, "Failed to write CMD_GET_APPLICATION_INFO: %d\n", ret);
+-		return ret;
+-	}
+-
+-	msleep(40);
+-
+-	ret = synaptics_tcm_read_header(ts, (unsigned char *)&header);
++	ret = synaptics_tcm_read_cmd_resp(ts, CMD_GET_APPLICATION_INFO, &header);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -382,20 +439,12 @@ static int synaptics_tcm_preserve_touch_report_config(struct synaptics_tcm_core
+ 	unsigned int len;
+ 	int ret;
+ 
+-	ret = synaptics_tcm_write_cmd(ts, CMD_GET_TOUCH_REPORT_CONFIG, NULL, 0);
+-	if (ret) {
+-		dev_warn(ts->dev, "GET_TOUCH_REPORT_CONFIG write failed: %d\n", ret);
+-		return ret;
+-	}
+-
+-	msleep(40);
+-
+-	ret = synaptics_tcm_read_header(ts, (unsigned char *)&header);
++	ret = synaptics_tcm_read_cmd_resp(ts, CMD_GET_TOUCH_REPORT_CONFIG, &header);
+ 	if (ret)
+ 		return ret;
+ 
+ 	len = get_unaligned_le16(header.length);
+-	if (len == 0 || len > 1024) {
++	if (len < 4 || len > 1024) {
+ 		dev_warn(ts->dev, "touch report config bad length %u\n", len);
+ 		return -ENODATA;
+ 	}
+@@ -600,18 +649,20 @@ static void synaptics_tcm_report_input(struct synaptics_tcm_core *ts,
+ 	if (!ts->input)
+ 		return;
+ 
+-	for (i = 0; i < nslots; i++) {
+-		if (!points[i].active)
+-			continue;
+-		input_mt_slot(ts->input, i);
+-		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
+-		touchscreen_report_pos(ts->input, &ts->props,
+-				       points[i].x, points[i].y, true);
+-		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR,
+-				 points[i].wx ? points[i].wx : 50);
+-		input_report_abs(ts->input, ABS_MT_TOUCH_MINOR,
+-				 points[i].wy ? points[i].wy : 50);
+-		__set_bit(i, &cur_slots);
++	if (points) {
++		for (i = 0; i < nslots; i++) {
++			if (!points[i].active)
++				continue;
++			input_mt_slot(ts->input, i);
++			input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
++			touchscreen_report_pos(ts->input, &ts->props,
++					       points[i].x, points[i].y, true);
++			input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR,
++					 points[i].wx ? points[i].wx : 50);
++			input_report_abs(ts->input, ABS_MT_TOUCH_MINOR,
++					 points[i].wy ? points[i].wy : 50);
++			__set_bit(i, &cur_slots);
++		}
+ 	}
+ 
+ 	for_each_set_bit(i, &ts->active_slots, nslots) {
+@@ -857,6 +908,8 @@ static int __maybe_unused synaptics_tcm_suspend(struct device *dev)
+ 		return 0;
+ 
+ 	disable_irq(ts->irq);
++	if (ts->input && ts->active_slots)
++		synaptics_tcm_report_input(ts, NULL, MAX_TOUCH_OBJECTS);
+ 	synaptics_tcm_enable_report(ts, REPORT_TOUCH, false);
+ 	synaptics_tcm_power_off(ts);
+ 	return 0;
+@@ -873,7 +926,17 @@ static int __maybe_unused synaptics_tcm_resume(struct device *dev)
+ 	if (ret)
+ 		dev_warn(dev, "resume power on failed: %d\n", ret);
+ 
+-		synaptics_tcm_preserve_touch_report_config(ts);
++	ret = synaptics_tcm_identify_chip(ts);
++	if (ret)
++		dev_warn(dev, "resume identify chip failed: %d\n", ret);
++
++	ret = synaptics_tcm_get_fw_config(ts);
++	if (ret)
++		dev_warn(dev, "resume get fw config failed: %d\n", ret);
++
++	ret = synaptics_tcm_preserve_touch_report_config(ts);
++	if (ret)
++		dev_warn(dev, "resume preserve touch config failed: %d\n", ret);
+ 
+ 	enable_irq(ts->irq);
+ 	synaptics_tcm_enable_report(ts, REPORT_TOUCH, true);

@@ -1,0 +1,13 @@
+[Unit]
+Description=Configure WCN6855 Bluetooth public address if unconfigured
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+StandardInput=null
+ExecStart=/usr/local/sbin/acepro-bt-addr.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

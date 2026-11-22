@@ -1,0 +1,762 @@
+diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
+index fd2631a5d..14d33177f 100644
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -385,6 +385,8 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-qrd.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-samsung-r0q.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-sony-xperia-nagara-pdx223.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm8450-sony-xperia-nagara-pdx224.dtb
++ovaltine-dtbs		+= sm8475-oneplus-ovaltine.dtb sm8475-ovaltine.dtbo
++dtb-$(CONFIG_ARCH_QCOM)	+= sm8475-oneplus-ovaltine.dtb ovaltine.dtb
+ 
+ sm8550-hdk-display-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo
+ sm8550-hdk-display-card-rear-camera-card-dtbs	:= sm8550-hdk.dtb sm8550-hdk-display-card.dtbo sm8550-hdk-rear-camera-card.dtbo
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+index 366a59474..2d17396a1 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_dsc_1_2.c
+@@ -235,6 +235,8 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
+ 		data |= BIT(12);
+ 	if (mode & DSC_MODE_MULTIPLEX)
+ 		data |= BIT(13);
++	if (!(mode & DSC_MODE_VIDEO))
++		data |= BIT(17);
+ 
+ 	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_CFG, data);
+ 
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index 3a2d2e230..3a7cd612c 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -132,6 +132,7 @@ struct msm_dsi_host {
+ 	bool byte_intf_clk_div_2;
+ 	unsigned long pixel_clk_rate;
+ 	unsigned long esc_clk_rate;
++	unsigned long hs_rate;
+ 
+ 	/* DSI v2 specific clocks */
+ 	struct clk *src_clk;
+@@ -670,6 +671,19 @@ unsigned long dsi_byte_clk_get_rate(struct mipi_dsi_host *host, bool is_bonded_d
+ 	else
+ 		pclk_bpp = mult_frac(pclk_rate, bpp, 8 * lanes);
+ 
++	/*
++	 * For command-mode panels declaring a minimum HS lane bit clock
++	 * (dsi->hs_rate), enforce byte_clk >= hs_rate / 8 so frame transfer
++	 * finishes well within the TE period.
++	 */
++	if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) &&
++	    !msm_host->cphy_mode && msm_host->hs_rate) {
++		unsigned long min_byte_clk = msm_host->hs_rate / 8;
++
++		if (pclk_bpp < min_byte_clk)
++			pclk_bpp = min_byte_clk;
++	}
++
+ 	return pclk_bpp;
+ }
+ 
+@@ -679,6 +693,17 @@ static void dsi_calc_pclk(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
+ 	msm_host->byte_clk_rate = dsi_byte_clk_get_rate(&msm_host->base, is_bonded_dsi,
+ 							msm_host->mode);
+ 
++	if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) &&
++	    !msm_host->cphy_mode && msm_host->hs_rate) {
++		u32 bpp = mipi_dsi_pixel_format_to_bpp(msm_host->format);
++		u8 lanes = msm_host->lanes ?: 1;
++		unsigned long min_pclk = mult_frac(msm_host->byte_clk_rate,
++						   8 * lanes, bpp);
++
++		if (msm_host->pixel_clk_rate < min_pclk)
++			msm_host->pixel_clk_rate = min_pclk;
++	}
++
+ 	DBG("pclk=%lu, bclk=%lu", msm_host->pixel_clk_rate,
+ 				msm_host->byte_clk_rate);
+ }
+@@ -1722,6 +1747,7 @@ static int dsi_host_attach(struct mipi_dsi_host *host,
+ 	msm_host->lanes = dsi->lanes;
+ 	msm_host->format = dsi->format;
+ 	msm_host->mode_flags = dsi->mode_flags;
++	msm_host->hs_rate = dsi->hs_rate;
+ 	if (dsi->dsc) {
+ 		msm_host->dsc = dsi->dsc;
+ 		if (dsi->mode_flags & MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT)
+@@ -1920,10 +1946,20 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
+ 	else
+ 		type = DRM_DSC_1_1_PRE_SCR;
+ 
+-	ret = drm_dsc_setup_rc_params(dsc, type);
+-	if (ret) {
+-		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
+-		return ret;
++	/*
++	 * Allow panels with non-default DSC 1.2 first_line_bpg_offset (such as
++	 * short slice_height panels matching vendor 12 bpg) to keep their value.
++	 */
++	{
++		u8 first_line_bpg_offset = dsc->first_line_bpg_offset;
++
++		ret = drm_dsc_setup_rc_params(dsc, type);
++		if (ret) {
++			DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
++			return ret;
++		}
++		if (first_line_bpg_offset)
++			dsc->first_line_bpg_offset = first_line_bpg_offset;
+ 	}
+ 
+ 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index c09597963..8821cb814 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -77,6 +77,18 @@ config DRM_PANEL_BOE_HIMAX8279D
+ 	  24 bit RGB per pixel. It provides a MIPI DSI interface to
+ 	  the host and has a built-in LED backlight.
+ 
++config DRM_PANEL_BOE_RM692E5
++	tristate "BOE RM692E5 1080x2412 DSI command mode panel"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	select DRM_DISPLAY_DSC_HELPER
++	select DRM_DISPLAY_HELPER
++	help
++	  Say Y here if you want to enable support for BOE RM692E5
++	  1080x2412 120Hz DSC command-mode AMOLED panel found in
++	  OnePlus Ace Pro (PGP110 / ovaltine).
++
+ config DRM_PANEL_BOE_TD4320
+ 	tristate "BOE TD4320 DSI panel"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index b40c7a42a..439cba8be 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_DRM_PANEL_ASUS_Z00T_TM5P5_NT35596) += panel-asus-z00t-tm5p5-n35596.
+ obj-$(CONFIG_DRM_PANEL_AUO_A030JTN01) += panel-auo-a030jtn01.o
+ obj-$(CONFIG_DRM_PANEL_BOE_BF060Y8M_AJ0) += panel-boe-bf060y8m-aj0.o
+ obj-$(CONFIG_DRM_PANEL_BOE_HIMAX8279D) += panel-boe-himax8279d.o
++obj-$(CONFIG_DRM_PANEL_BOE_RM692E5) += panel-boe-rm692e5.o
+ obj-$(CONFIG_DRM_PANEL_BOE_TD4320) += panel-boe-td4320.o
+ obj-$(CONFIG_DRM_PANEL_BOE_TH101MB31UIG002_28A) += panel-boe-th101mb31ig002-28a.o
+ obj-$(CONFIG_DRM_PANEL_BOE_TV101WUM_LL2) += panel-boe-tv101wum-ll2.o
+diff --git a/drivers/input/touchscreen/synaptics_tcm_spi.c b/drivers/input/touchscreen/synaptics_tcm_spi.c
+index f1ee012e7..881c30096 100644
+--- a/drivers/input/touchscreen/synaptics_tcm_spi.c
++++ b/drivers/input/touchscreen/synaptics_tcm_spi.c
+@@ -77,6 +77,7 @@ static int synaptics_tcm_spi_probe(struct spi_device *spi)
+ static const struct spi_device_id synaptics_tcm_spi_ids[] = {
+ 	{ .name = "tcm-spi" },
+ 	{ .name = "s3910" },
++	{ .name = "synaptics-s3910" },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(spi, synaptics_tcm_spi_ids);
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 5cc5bff2c..1356676a3 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -6,6 +6,7 @@
+  */
+ #include <linux/auxiliary_bus.h>
+ #include <linux/devm-helpers.h>
++#include <linux/jiffies.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/delay.h>
+@@ -539,6 +540,10 @@ struct qcom_battmgr {
+ 
+ 	struct delayed_work	otg_init_work;
+ 
++	unsigned long last_bat_notif_jiffies;
++	unsigned long last_usb_notif_jiffies;
++	unsigned long usb_cache_jiffies[POWER_SUPPLY_PROP_USB_TYPE + 1];
++
+ 
+ 	/*
+ 	 * @lock is used to prevent concurrent power supply requests to the
+@@ -1234,6 +1239,33 @@ static const u8 sm8350_usb_prop_map[] = {
+ 	[POWER_SUPPLY_PROP_USB_TYPE] = USB_TYPE,
+ };
+ 
++static unsigned int qcom_battmgr_map_usb_type(u32 raw)
++{
++	switch (raw) {
++	case POWER_SUPPLY_USB_TYPE_UNKNOWN:
++	case POWER_SUPPLY_USB_TYPE_SDP:
++	case POWER_SUPPLY_USB_TYPE_DCP:
++	case POWER_SUPPLY_USB_TYPE_CDP:
++	case POWER_SUPPLY_USB_TYPE_ACA:
++	case POWER_SUPPLY_USB_TYPE_C:
++	case POWER_SUPPLY_USB_TYPE_PD:
++	case POWER_SUPPLY_USB_TYPE_PD_DRP:
++	case POWER_SUPPLY_USB_TYPE_PD_PPS:
++	case POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID:
++		return raw;
++	case 9:
++		/*
++		 * Linux 5.10 ADSP firmware reports APPLE_BRICK_ID as 9, whereas
++		 * Linux 7.3 shifted APPLE_BRICK_ID to 11 after inserting SPR_AVS.
++		 */
++		return POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID;
++	case POWER_SUPPLY_USB_TYPE_PD_SDP:
++		return POWER_SUPPLY_USB_TYPE_PD;
++	default:
++		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	}
++}
++
+ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
+ 					  enum power_supply_property psp)
+ {
+@@ -1243,6 +1275,11 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
+ 	if (psp >= ARRAY_SIZE(sm8350_usb_prop_map))
+ 		return -EINVAL;
+ 
++	if (psp <= POWER_SUPPLY_PROP_USB_TYPE &&
++	    battmgr->usb_cache_jiffies[psp] &&
++	    time_before(jiffies, battmgr->usb_cache_jiffies[psp] + msecs_to_jiffies(250)))
++		return 0;
++
+ 	prop = sm8350_usb_prop_map[psp];
+ 
+         /*
+@@ -1259,6 +1296,8 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
+ 	mutex_lock(&battmgr->lock);
+ 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET, prop, 0);
+ 	mutex_unlock(&battmgr->lock);
++	if (!ret && psp <= POWER_SUPPLY_PROP_USB_TYPE)
++		battmgr->usb_cache_jiffies[psp] = jiffies ?: 1;
+ 
+ 	return ret;
+ }
+@@ -1650,23 +1689,32 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 	switch (notification) {
+ 	case NOTIF_BAT_INFO:
+ 		battmgr->info.valid = false;
+-		fallthrough;
++		battmgr->last_bat_notif_jiffies = jiffies;
++		power_supply_changed(battmgr->bat_psy);
++		break;
+ 	case NOTIF_BAT_STATUS:
+ 	case NOTIF_BAT_PROPERTY:
+ 	case NOTIF_BAT_CHARGING_STATE:
+-		power_supply_changed(battmgr->bat_psy);
++		if (time_after(jiffies, battmgr->last_bat_notif_jiffies + msecs_to_jiffies(250))) {
++			battmgr->last_bat_notif_jiffies = jiffies;
++			power_supply_changed(battmgr->bat_psy);
++		}
+ 		break;
+ 	case BC_CID_NOTIF:
+ 	case NOTIF_USB_PROPERTY:
+-		power_supply_changed(battmgr->usb_psy);
++	case NOTIF_TYPEC_STATE_CHANGE:
++		if (time_after(jiffies, battmgr->last_usb_notif_jiffies + msecs_to_jiffies(250))) {
++			battmgr->last_usb_notif_jiffies = jiffies;
++			memset(battmgr->usb_cache_jiffies, 0, sizeof(battmgr->usb_cache_jiffies));
++			power_supply_changed(battmgr->usb_psy);
++		}
+ 		break;
+ 	case NOTIF_WLS_PROPERTY:
+ 		power_supply_changed(battmgr->wls_psy);
+ 		break;
+-        case NOTIF_TYPEC_STATE_CHANGE:
+-		power_supply_changed(battmgr->usb_psy);
+-		break;
+         case NOTIF_PLUGIN_IRQ:
++		memset(battmgr->usb_cache_jiffies, 0, sizeof(battmgr->usb_cache_jiffies));
++		battmgr->last_usb_notif_jiffies = jiffies;
+ 		// power_supply_changed(battmgr->bat_psy);
+                 /*
+                  * The ADSP may not have updated USB_ONLINE yet, so the
+@@ -2030,7 +2078,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
+ 			break;
+ 		case USB_TYPE:
+-			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
++			battmgr->usb.usb_type = qcom_battmgr_map_usb_type(le32_to_cpu(resp->intval.value));
+ 			break;
+                 case USB_ADAP_TYPE:
+                         /*
+@@ -2040,7 +2088,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+                          * adapter type (PD/DCP/etc.) instead of SDP.
+                          */
+                         battmgr->usb.adap_type = le32_to_cpu(resp->intval.value);
+-                        battmgr->usb.usb_type = battmgr->usb.adap_type;
++                        battmgr->usb.usb_type = qcom_battmgr_map_usb_type(battmgr->usb.adap_type);
+                         break;
+                 case USB_OPLUS_VOOCPHY_STATUS:
+                         battmgr->usb.voocphy_status_raw = le32_to_cpu(resp->intval.value);
+diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
+index 954be9343..a132b2f99 100644
+--- a/drivers/ufs/host/ufs-qcom.c
++++ b/drivers/ufs/host/ufs-qcom.c
+@@ -347,7 +347,9 @@ static void ufs_qcom_disable_lane_clks(struct ufs_qcom_host *host)
+ 	if (!host->is_lane_clks_enabled)
+ 		return;
+ 
+-	clk_bulk_disable_unprepare(host->num_clks, host->clks);
++	clk_disable_unprepare(host->rx_lane1_sync_clk);
++	clk_disable_unprepare(host->rx_lane0_sync_clk);
++	clk_disable_unprepare(host->tx_lane0_sync_clk);
+ 
+ 	host->is_lane_clks_enabled = false;
+ }
+@@ -356,28 +358,57 @@ static int ufs_qcom_enable_lane_clks(struct ufs_qcom_host *host)
+ {
+ 	int err;
+ 
+-	err = clk_bulk_prepare_enable(host->num_clks, host->clks);
++	if (host->is_lane_clks_enabled)
++		return 0;
++
++	err = clk_prepare_enable(host->tx_lane0_sync_clk);
+ 	if (err)
+-		return err;
++		goto out;
++
++	err = clk_prepare_enable(host->rx_lane0_sync_clk);
++	if (err)
++		goto out_disable_tx_lane0;
++
++	err = clk_prepare_enable(host->rx_lane1_sync_clk);
++	if (err)
++		goto out_disable_rx_lane0;
+ 
+ 	host->is_lane_clks_enabled = true;
+ 
+ 	return 0;
++
++out_disable_rx_lane0:
++	clk_disable_unprepare(host->rx_lane0_sync_clk);
++out_disable_tx_lane0:
++	clk_disable_unprepare(host->tx_lane0_sync_clk);
++out:
++	return err;
+ }
+ 
+ static int ufs_qcom_init_lane_clks(struct ufs_qcom_host *host)
+ {
+-	int err;
+ 	struct device *dev = host->hba->dev;
+ 
+ 	if (has_acpi_companion(dev))
+ 		return 0;
+ 
+-	err = devm_clk_bulk_get_all(dev, &host->clks);
+-	if (err <= 0)
+-		return err;
++	host->tx_lane0_sync_clk = devm_clk_get(dev, "tx_lane0_sync_clk");
++	if (IS_ERR(host->tx_lane0_sync_clk))
++		return dev_err_probe(dev, PTR_ERR(host->tx_lane0_sync_clk),
++				     "failed to get tx_lane0_sync_clk\n");
++
++	host->rx_lane0_sync_clk = devm_clk_get(dev, "rx_lane0_sync_clk");
++	if (IS_ERR(host->rx_lane0_sync_clk))
++		return dev_err_probe(dev, PTR_ERR(host->rx_lane0_sync_clk),
++				     "failed to get rx_lane0_sync_clk\n");
+ 
+-	host->num_clks = err;
++	/* In case of single lane per direction, don't read lane1 clocks */
++	if (host->hba->lanes_per_direction > 1) {
++		host->rx_lane1_sync_clk = devm_clk_get(dev, "rx_lane1_sync_clk");
++		if (IS_ERR(host->rx_lane1_sync_clk))
++			return dev_err_probe(dev, PTR_ERR(host->rx_lane1_sync_clk),
++					     "failed to get rx_lane1_sync_clk\n");
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/ufs/host/ufs-qcom.h b/drivers/ufs/host/ufs-qcom.h
+index a5ad5ce44..944b2e532 100644
+--- a/drivers/ufs/host/ufs-qcom.h
++++ b/drivers/ufs/host/ufs-qcom.h
+@@ -330,8 +330,9 @@ struct ufs_qcom_host {
+ 	struct phy *generic_phy;
+ 	struct ufs_hba *hba;
+ 	struct ufs_pa_layer_attr dev_req_params;
+-	struct clk_bulk_data *clks;
+-	u32 num_clks;
++	struct clk *tx_lane0_sync_clk;
++	struct clk *rx_lane0_sync_clk;
++	struct clk *rx_lane1_sync_clk;
+ 	bool is_lane_clks_enabled;
+ 
+ 	struct icc_path *icc_ddr;
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index ac68b4218..894f8417c 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -570,9 +570,9 @@ static void dwc3_qcom_set_role_notifier(struct dwc3 *dwc, enum usb_role next_rol
+ 		return;
+ 	}
+ 
+-	if (qcom->current_role == USB_ROLE_DEVICE)
++	if (next_role == USB_ROLE_HOST)
+ 		dwc3_qcom_vbus_override_enable(qcom, false);
+-	else if (qcom->current_role != USB_ROLE_DEVICE)
++	else
+ 		dwc3_qcom_vbus_override_enable(qcom, true);
+ 
+ 	pm_runtime_mark_last_busy(qcom->dev);
+@@ -692,10 +692,12 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 		dwc3_qcom_vbus_override_enable(qcom, true);
+ 	} else {
+ 		if ((device_property_read_bool(dev, "usb-role-switch")) &&
+-		    (usb_get_role_switch_default_mode(dev) == USB_DR_MODE_HOST))
++		    (usb_get_role_switch_default_mode(dev) == USB_DR_MODE_HOST)) {
+ 			qcom->current_role = USB_ROLE_HOST;
+-		else
++		} else {
+ 			qcom->current_role = USB_ROLE_DEVICE;
++			dwc3_qcom_vbus_override_enable(qcom, true);
++		}
+ 	}
+ 
+ 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;
+diff --git a/sound/soc/codecs/tfa9872.c b/sound/soc/codecs/tfa9872.c
+index 186c3d02a..8efcb067f 100644
+--- a/sound/soc/codecs/tfa9872.c
++++ b/sound/soc/codecs/tfa9872.c
+@@ -6,9 +6,12 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/module.h>
+ #include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
+ #include <sound/soc.h>
+ 
+ #define TFA987X_SYS_CTRL0		0x00
+@@ -119,8 +122,62 @@ static const struct snd_soc_component_driver tfa987x_component = {
+ 	.endianness		= 1,
+ };
+ 
++static int tfa987x_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
++	case SND_SOC_DAIFMT_BC_FC:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
++	case SND_SOC_DAIFMT_NB_NF:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_I2S:
++	case SND_SOC_DAIFMT_DSP_A:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int tfa987x_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
++				unsigned int rx_mask, int slots, int slot_width)
++{
++	struct regmap *rmap = dev_get_regmap(dai->dev, NULL);
++	int ret;
++
++	if (!rmap)
++		return -ENODEV;
++
++	if (slots < 1 || slots > 8 || (slot_width != 16 && slot_width != 32))
++		return -EINVAL;
++
++	ret = regmap_update_bits(rmap, TFA987X_TDM_CFG1,
++				 TFA987X_TDM_CFG1_NSLOTS_MSK |
++				 TFA987X_TDM_CFG1_SLOTBITS_MSK,
++				 FIELD_PREP(TFA987X_TDM_CFG1_NSLOTS_MSK, slots - 1) |
++				 FIELD_PREP(TFA987X_TDM_CFG1_SLOTBITS_MSK, slot_width - 1));
++	if (ret < 0)
++		return ret;
++
++	return regmap_update_bits(rmap, TFA987X_TDM_CFG2,
++				  TFA987X_TDM_CFG2_SWIDTH_MSK,
++				  FIELD_PREP(TFA987X_TDM_CFG2_SWIDTH_MSK, slot_width - 1));
++}
++
+ static const struct snd_soc_dai_ops tfa987x_dai_ops = {
+ 	.mute_stream = tfa987x_digital_mute,
++	.set_fmt = tfa987x_set_fmt,
++	.set_tdm_slot = tfa987x_set_tdm_slot,
+ };
+ 
+ static struct snd_soc_dai_driver tfa987x_dai = {
+@@ -216,14 +273,46 @@ static bool tfa987x_setup_dcdc(struct device *dev, struct regmap *rmap, u16 rev)
+ 	return true;
+ }
+ 
++static void tfa987x_regulator_disable(void *data)
++{
++	regulator_disable(data);
++}
++
+ static int tfa987x_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct device *dev = &i2c->dev;
++	struct gpio_desc *reset_gpio;
++	struct regulator *vdd;
+ 	struct regmap *rmap;
+ 	unsigned int rev;
+ 	u32 channel_index = 0;
+ 	int ret;
+ 
++	vdd = devm_regulator_get_optional(dev, "vdd");
++	if (IS_ERR(vdd)) {
++		ret = PTR_ERR(vdd);
++		if (ret != -ENODEV)
++			return ret;
++		vdd = NULL;
++	}
++	if (vdd) {
++		ret = regulator_enable(vdd);
++		if (ret < 0)
++			return ret;
++		ret = devm_add_action_or_reset(dev, tfa987x_regulator_disable, vdd);
++		if (ret < 0)
++			return ret;
++	}
++
++	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(reset_gpio))
++		return PTR_ERR(reset_gpio);
++	if (reset_gpio) {
++		msleep(2);
++		gpiod_set_value_cansleep(reset_gpio, 0);
++		msleep(2);
++	}
++
+ 	rmap = devm_regmap_init_i2c(i2c, &tfa987x_regmap_config);
+ 	if (IS_ERR(rmap))
+ 		return PTR_ERR(rmap);
+diff --git a/sound/soc/qcom/qdsp6/audioreach.c b/sound/soc/qcom/qdsp6/audioreach.c
+index cce0ad31f..a004e1c6e 100644
+--- a/sound/soc/qcom/qdsp6/audioreach.c
++++ b/sound/soc/qcom/qdsp6/audioreach.c
+@@ -301,7 +301,7 @@ EXPORT_SYMBOL_GPL(audioreach_alloc_cmd_pkt);
+ 
+ void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t token)
+ {
+-	return __audioreach_alloc_pkt(pkt_size, opcode, token, GPR_APM_MODULE_IID,
++	return __audioreach_alloc_pkt(pkt_size, opcode, token, q6apm_get_src_port(),
+ 				       APM_MODULE_INSTANCE_ID, true);
+ }
+ EXPORT_SYMBOL_GPL(audioreach_alloc_apm_cmd_pkt);
+diff --git a/sound/soc/qcom/qdsp6/q6apm.c b/sound/soc/qcom/qdsp6/q6apm.c
+index f167b9dae..1e2b1b82a 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.c
++++ b/sound/soc/qcom/qdsp6/q6apm.c
+@@ -140,14 +140,45 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
+ }
+ 
+ 
++uint32_t q6apm_get_src_port(void)
++{
++	return (g_apm && g_apm->gdev) ? g_apm->gdev->svc.id : GPR_APM_MODULE_IID;
++}
++EXPORT_SYMBOL_GPL(q6apm_get_src_port);
++
+ static int q6apm_get_apm_state(struct q6apm *apm)
+ {
+-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
+-								APM_CMD_GET_SPF_STATE, 0);
++	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(0,
++					APM_CMD_GET_SPF_STATE, 0, apm->gdev->svc.id);
++	int retry;
++
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+ 
+-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
++	/*
++	 * Stock SM8475 SPF rejects an 8-byte APM command header on
++	 * APM_CMD_GET_SPF_STATE and expects a 24-byte bare GPR header with a
++	 * short polling retry while ADSP services finish initializing.
++	 */
++	for (retry = 0; retry < 40; retry++) {
++		long rc;
++
++		mutex_lock(&apm->lock);
++		apm->result.opcode = 0;
++		apm->result.status = 0;
++		rc = gpr_send_pkt(apm->gdev, pkt);
++		if (rc >= 0)
++			rc = wait_event_timeout(apm->wait,
++						apm->result.opcode == APM_CMD_RSP_GET_SPF_STATE,
++						msecs_to_jiffies(50));
++		mutex_unlock(&apm->lock);
++
++		if (apm->state)
++			return apm->state;
++
++		if (rc > 0)
++			msleep(50);
++	}
+ 
+ 	return apm->state;
+ }
+@@ -216,8 +247,9 @@ static int __q6apm_map_memory_fixed_region(struct device *dev, unsigned int grap
+ 	uint32_t buf_sz;
+ 	void *p;
+ 	uint32_t pos_mask = is_pos_buf ? APM_MMAP_TOKEN_MAP_TYPE_POS_BUF : 0;
+-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(payload_size,
+-					APM_CMD_SHARED_MEM_MAP_REGIONS, (graph_id | pos_mask));
++	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(payload_size,
++					APM_CMD_SHARED_MEM_MAP_REGIONS, (graph_id | pos_mask),
++					q6apm_get_src_port());
+ 
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+@@ -326,8 +358,9 @@ static int __q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int gr
+ 	struct q6apm *apm = dev_get_drvdata(dev->parent);
+ 	struct audioreach_graph_info *info;
+ 	uint32_t mem_map_handle;
+-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(sizeof(*cmd),
+-						APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id);
++	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(sizeof(*cmd),
++						APM_CMD_SHARED_MEM_UNMAP_REGIONS, graph_id,
++						q6apm_get_src_port());
+ 	if (IS_ERR(pkt))
+ 		return PTR_ERR(pkt);
+ 
+@@ -952,12 +985,12 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
+ 			wake_up(&apm->wait);
+ 			break;
+ 		case APM_CMD_SHARED_MEM_UNMAP_REGIONS:
+-			apm->result.opcode = hdr->opcode;
+-			apm->result.status = 0;
++			apm->result.opcode = result->opcode;
++			apm->result.status = result->status;
+ 			rsp = data->payload;
+ 
+ 			info = idr_find(&apm->graph_info_idr, hdr->token);
+-			if (info)
++			if (info && !result->status)
+ 				info->mem_map_handle = 0;
+ 			else
+ 				dev_err(dev, "Error (%d) Processing 0x%08x cmd\n", result->status,
+diff --git a/sound/soc/qcom/qdsp6/q6apm.h b/sound/soc/qcom/qdsp6/q6apm.h
+index 5cb51ca49..992a843e9 100644
+--- a/sound/soc/qcom/qdsp6/q6apm.h
++++ b/sound/soc/qcom/qdsp6/q6apm.h
+@@ -149,6 +149,7 @@ int q6apm_unmap_memory_fixed_region(struct device *dev, unsigned int graph_id);
+ /* Helpers */
+ int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
+ 			uint32_t rsp_opcode);
++uint32_t q6apm_get_src_port(void);
+ 
+ /* Callback for graph specific */
+ struct audioreach_module *q6apm_find_module_by_mid(struct q6apm_graph *graph,
+diff --git a/sound/soc/qcom/sc8280xp.c b/sound/soc/qcom/sc8280xp.c
+index 4d48e1012..66f658617 100644
+--- a/sound/soc/qcom/sc8280xp.c
++++ b/sound/soc/qcom/sc8280xp.c
+@@ -390,6 +390,74 @@ static void sc8280xp_add_be_ops(struct snd_soc_card *card)
+ 	}
+ }
+ 
++static const struct snd_soc_dapm_route sm8475_wcd_tx_routes[] = {
++	{ "TX SWR_INPUT0", NULL, "ADC1_OUTPUT" },
++	{ "TX SWR_INPUT1", NULL, "ADC2_OUTPUT" },
++	{ "TX SWR_INPUT0", NULL, "ADC3_OUTPUT" },
++	{ "TX SWR_INPUT1", NULL, "ADC4_OUTPUT" },
++};
++
++static bool sc8280xp_is_legacy_of_route(const struct snd_soc_dapm_route *r)
++{
++	if (!r->sink || !r->source)
++		return false;
++
++	if (!strcmp(r->sink, "TX SWR_INPUT") ||
++	    !strcmp(r->sink, "VA SWR_INPUT") ||
++	    !strcmp(r->source, "WCD_TX_OUTPUT") ||
++	    !strncmp(r->sink, "VA AMIC", 7))
++		return true;
++
++	return false;
++}
++
++/*
++ * Older sm8475 device trees carry downstream widget names (VA AMIC*,
++ * TX/VA SWR_INPUT, WCD_TX_OUTPUT) that do not exist in mainline codecs;
++ * drop them and install the matching mainline WCD->TX SWR ADC routes.
++ */
++static void sc8280xp_sanitize_of_routes(struct snd_soc_card *card)
++{
++	struct snd_soc_dapm_route *filtered;
++	int i, kept = 0;
++	bool need_wcd_tx = false, has_legacy = false;
++
++	if (!card->of_dapm_routes || !card->num_of_dapm_routes)
++		return;
++
++	for (i = 0; i < card->num_of_dapm_routes; i++) {
++		if (sc8280xp_is_legacy_of_route(&card->of_dapm_routes[i])) {
++			has_legacy = true;
++			break;
++		}
++	}
++	if (!has_legacy)
++		return;
++
++	filtered = devm_kcalloc(card->dev, card->num_of_dapm_routes,
++				sizeof(*filtered), GFP_KERNEL);
++	if (!filtered)
++		return;
++
++	for (i = 0; i < card->num_of_dapm_routes; i++) {
++		const struct snd_soc_dapm_route *r = &card->of_dapm_routes[i];
++
++		if (sc8280xp_is_legacy_of_route(r)) {
++			if (r->source && !strcmp(r->source, "WCD_TX_OUTPUT"))
++				need_wcd_tx = true;
++			continue;
++		}
++		filtered[kept++] = *r;
++	}
++
++	card->of_dapm_routes = filtered;
++	card->num_of_dapm_routes = kept;
++	if (need_wcd_tx && !card->dapm_routes) {
++		card->dapm_routes = sm8475_wcd_tx_routes;
++		card->num_dapm_routes = ARRAY_SIZE(sm8475_wcd_tx_routes);
++	}
++}
++
+ static int sc8280xp_platform_probe(struct platform_device *pdev)
+ {
+ 	struct snd_soc_card *card;
+@@ -425,6 +493,8 @@ static int sc8280xp_platform_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	sc8280xp_sanitize_of_routes(card);
++
+ 	card->driver_name = data->priv->driver_name;
+ 	sc8280xp_add_be_ops(card);
+ 	return devm_snd_soc_register_card(dev, card);
+@@ -523,6 +593,10 @@ static const struct qcom_snd_soc_common sm8475_priv_data = {
+ 	.dapm_widgets = sc8280xp_dapm_widgets,
+ 	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
+ 	.wcd_jack = true,
++	.mi2s_bclk_enable = true,
++	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
++			 SND_SOC_DAIFMT_NB_NF |
++			 SND_SOC_DAIFMT_I2S,
+ };
+ 
+ static const struct qcom_snd_soc_common sm8550_priv_data = {

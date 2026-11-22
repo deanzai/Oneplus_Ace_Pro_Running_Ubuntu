@@ -1,0 +1,13 @@
+--- a/arch/arm64/boot/dts/qcom/sm8475-oneplus-ovaltine.dts
++++ b/arch/arm64/boot/dts/qcom/sm8475-oneplus-ovaltine.dts
+@@ -878,7 +878,10 @@
+ };
+ 
+ &usb_1 {
++	qcom,select-utmi-as-pipe-clk;
+ 	maximum-speed = "high-speed";
++	phys = <&usb_1_hsphy>;
++	phy-names = "usb2-phy";
+ 	status = "okay";
+ };
+ 

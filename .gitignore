@@ -1,0 +1,17 @@
+*.img
+*.ko
+*.o
+*.a
+*.so
+*.cpio
+*.cpio.*
+*.tar
+*.tar.*
+*.gz
+*.xz
+*.zst
+out/
+build/
+.DS_Store
+__pycache__/
+*.pyc

@@ -1,0 +1,11 @@
+[Unit]
+Description=Mainline SM8475 EAS & schedutil tuning
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/acepro-sched-tuning.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

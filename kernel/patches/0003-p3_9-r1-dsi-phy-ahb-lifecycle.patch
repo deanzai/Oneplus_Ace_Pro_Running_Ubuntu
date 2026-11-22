@@ -1,0 +1,112 @@
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.h
+@@ -107,6 +107,7 @@
+ 	int id;
+ 
+ 	struct regulator_bulk_data *supplies;
++	struct clk *iface_clk;
+ 
+ 	struct msm_dsi_dphy_timing timing;
+ 	const struct msm_dsi_phy_cfg *cfg;
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy.c
+@@ -3,9 +3,9 @@
+  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/clk.h>
+ #include <linux/clk-provider.h>
+ #include <linux/platform_device.h>
+-#include <linux/pm_clock.h>
+ #include <linux/pm_runtime.h>
+ #include <dt-bindings/phy/phy.h>
+ 
+@@ -687,23 +687,35 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = devm_pm_clk_create(dev);
++	phy->iface_clk = devm_clk_get(dev, "iface");
++	if (IS_ERR(phy->iface_clk))
++		return dev_err_probe(dev, PTR_ERR(phy->iface_clk),
++				     "Unable to get iface clk\n");
++
++	ret = clk_prepare_enable(phy->iface_clk);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(dev, ret, "Unable to enable iface clk\n");
+ 
+-	ret = pm_clk_add(dev, "iface");
+-	if (ret < 0)
+-		return dev_err_probe(dev, ret, "Unable to get iface clk\n");
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret) {
++		clk_disable_unprepare(phy->iface_clk);
++		return dev_err_probe(dev, ret, "Unable to resume phy dev\n");
++	}
+ 
+ 	if (phy->cfg->ops.pll_init) {
+ 		ret = phy->cfg->ops.pll_init(phy);
+-		if (ret)
++		if (ret) {
++			pm_runtime_put_sync(dev);
++			clk_disable_unprepare(phy->iface_clk);
+ 			return dev_err_probe(dev, ret,
+ 					     "PLL init failed; need separate clk driver\n");
++		}
+ 	}
+ 
+ 	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get,
+ 				     phy->provided_clocks);
++	pm_runtime_put_sync(dev);
++	clk_disable_unprepare(phy->iface_clk);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to register clk provider\n");
+@@ -711,16 +723,11 @@
+ 	return 0;
+ }
+ 
+-static const struct dev_pm_ops dsi_phy_pm_ops = {
+-	SET_RUNTIME_PM_OPS(pm_clk_suspend, pm_clk_resume, NULL)
+-};
+-
+ static struct platform_driver dsi_phy_platform_driver = {
+ 	.probe      = dsi_phy_driver_probe,
+ 	.driver     = {
+ 		.name   = "msm_dsi_phy",
+ 		.of_match_table = dsi_phy_dt_match,
+-		.pm = &dsi_phy_pm_ops,
+ 	},
+ };
+ 
+@@ -746,6 +753,13 @@
+ 
+ 	dev = &phy->pdev->dev;
+ 
++	ret = clk_prepare_enable(phy->iface_clk);
++	if (ret) {
++		DRM_DEV_ERROR(dev, "%s: iface clk enable failed, %d\n",
++			__func__, ret);
++		return ret;
++	}
++
+ 	ret = pm_runtime_resume_and_get(dev);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(dev, "%s: resume failed, %d\n",
+@@ -794,6 +808,7 @@
+ reg_en_fail:
+ 	pm_runtime_put(dev);
+ res_en_fail:
++	clk_disable_unprepare(phy->iface_clk);
+ 	return ret;
+ }
+ 
+@@ -806,6 +821,7 @@
+ 
+ 	regulator_bulk_disable(phy->cfg->num_regulators, phy->supplies);
+ 	pm_runtime_put(&phy->pdev->dev);
++	clk_disable_unprepare(phy->iface_clk);
+ }
+ 
+ void msm_dsi_phy_set_usecase(struct msm_dsi_phy *phy,

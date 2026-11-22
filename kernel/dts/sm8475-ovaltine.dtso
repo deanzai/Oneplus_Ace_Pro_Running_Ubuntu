@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Minimal DTBO for OnePlus Ace Pro (PGP110 / ovaltine) ABL matching.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	model = "Qualcomm Technologies, Inc. Cape MTP, Ovaltine";
+	compatible = "oneplus,ovaltine", "qcom,sm8475", "qcom,sm8450", "qcom,cape-mtp", "qcom,cape";
+	qcom,msm-id = <0x213 0x10000 0x21c 0x10000 0x212 0x10000>;
+	qcom,board-id = <0x10008 0x00>;
+	oplus,project-id = <0x5552 0x5551>;
+	oplus,region-id = <0x01 0x02>;
+
+	__fixups__ {};
+};

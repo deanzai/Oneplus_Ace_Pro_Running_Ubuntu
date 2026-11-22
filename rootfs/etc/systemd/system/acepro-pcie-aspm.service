@@ -1,0 +1,13 @@
+[Unit]
+Description=Disable PCIe ASPM for WCN6855 stability on Ace Pro
+DefaultDependencies=no
+After=sys-kernel-config.mount systemd-modules-load.service
+Before=systemd-udevd.service NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo performance > /sys/module/pcie_aspm/parameters/policy 2>/dev/null || true; for f in /sys/bus/pci/devices/0000:01:00.0/link/*aspm /sys/bus/pci/devices/0000:01:00.0/link/*pcipm; do [ -w "$f" ] && echo 0 > "$f" 2>/dev/null || true; done'
+
+[Install]
+WantedBy=sysinit.target
