@@ -4,11 +4,11 @@
 
 # 一加 Ace Pro (PGP110 / ovaltine) 主线 Linux 移植完整工程指导手册
 
-> **文档版本**：v2.3 (P3.10 里程碑归档：P3.9 基线 + S2R `deep`/`s2idle` `synaptics_tcm` 唤醒触控修复)  
+> **文档版本**：v2.4 (P3.11 里程碑归档：P3.10 基线 + `qcom_battmgr` 墙充限流与 VoocPHY 熔断回落修复)  
 > **更新时间**：2026-11-23  
 > **目标系统**：Ubuntu Desktop / Phosh Mobile Linux (Linux 7.3.0-rc4 mainline)  
 > **目标机型**：一加 Ace Pro (OnePlus Ace Pro / PGP110 / 内部代号 `ovaltine` / 项目代号 `21841`)  
-> **当前实机运行版本**：**P3.10 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`，实机验证 `boot_id`: `0d115116-2a2e-4642-be35-2f3d8299ba8b`；归档路径：[development/milestones/P3_10/](development/milestones/P3_10/)）
+> **当前实机运行版本**：**P3.11 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.11 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`，实机验证 `boot_id`: `1f42788e-acce-4ddf-8d20-27f8af57d469`；归档路径：[development/milestones/P3_11/](development/milestones/P3_11/)）
 
 ---
 
@@ -145,12 +145,11 @@ oplus,region-id = <0x01 0x02>;
     ```
   * 禁用后 `qnoc-sm8450` 立即完成 `sync_state()`，空闲内存带宽投票不再钉死 `INT_MAX`（P3.4 后降为 CPU 温度 47~50°C，P3.6/P3.7 受控待机窗口 `cpuss0-thermal` 中位数为 44.80°C；剩余空闲功耗保活链详见第 9 节 R1→R5 排查）。
 
-### 4.4 电池管理器中断风暴 (CPU 占满与日志刷屏)
-* **问题现象**：`systemd-journald` 占用单核 33% CPU，日志狂刷 `qcom_battmgr` 报错，2 秒内产生约 7000 次中断。
-* **根因分析**：
-  * 原厂 PMIC GLINK 发送的电池事件响应中包含 enum 9（私有快充状态枚举），主线驱动 `drivers/power/supply/qcom_battmgr.c` 缺少对该枚举的映射，落入 default 分支反复抛出错误信息。
-* **最终修复方案**：
-  * 在 `qcom_battmgr.c` 中补齐 enum 9 的静默处理，中断频率骤降至 3 次/2秒，CPU 占用恢复归零。
+### 4.4 电池管理器中断风暴与墙充限流回落 (P3.11 完善)
+* **历史问题（P3.4 修复）**：`systemd-journald` 占用单核 33% CPU，日志狂刷 `qcom_battmgr` 报错，2 秒内产生约 7000 次中断（原厂 PMIC GLINK 发送私有 enum 9，已静默处理）。
+* **P3.11 墙充限流与 VoocPHY 熔断修复 (`TASK-20261123-220715`)**：
+  * **问题根因**：Oplus Linux 5.10 ADSP 上报墙插充电器 `adap_type=9` 时，驱动误落入 `SDP 500mA` 默认限流；且当 `DCP` 触发 `ADSP_VPHY_FAST_NOTIFY_COMMU_TIME_OUT` 时，`voocphy_status_worker` 与 `voocphy_recheck` 每 ~5.6 秒无限清零 `vooc_limits_set` 并重发 `USB_OPLUS_VOOCPHY_ENABLE = 1` 导致无法稳定充入。
+  * **最终修复**：新增 `qcom_battmgr_map_usb_type()`（映射 `9 -> APPLE_BRICK_ID`、`PD_SDP(17) -> PD`）、提取公共限流配置函数 `qcom_battmgr_oplus_apply_adap_limits()`（为 `case 9 / APPLE_BRICK_ID` 设置 `5V/2.0A` ICL/FCC），并在 `vooc_commu_failures >= 2` 时熔断 `vooc_fallback_active = true` 降级为标准 `5V/2.0A`（真拔线 `usb_offline_count >= 2` 复位）。实机 60s 墙充验证识别 `type=9` (2.0A) 并协商 `PD_PPS` (9V/3A)，`bat.current_now=+666~+675mA`、零 `COMMU_TIME_OUT`、电量 60s 内实涨 `16% -> 17%`。
 
 ### 4.5 Merged-usr 软链接覆写死机防护 (Rootfs 损坏规避)
 * **问题现象**：向手机解压模块包时，若执行 `tar -xf modules.tar.gz -C /`，会将 Ubuntu 24.04 的 `/lib -> usr/lib` 软链接替换为一个普通实体文件夹，导致系统 `libc.so.6` 找不到，下次重启直接 kernel panic 报找不到 `init`。
@@ -367,6 +366,10 @@ ssh root@172.16.42.1 "tar -xzf /tmp/p3_5_modules_fw.tar.gz -C /usr && depmod -a 
 ## 10. P3.8 / P3.9 研发进度与里程碑交付
 
 P3.8 围绕 **R3（USB HS-only）** 与 **R1（显示 DSI PHY AHB `prepare` 生命周期）** 完成交付并归档于 [development/milestones/P3_8/](development/milestones/P3_8/)；随后 **P3.9 (`TASK-20261120-010302`)** 完成 **R2（GPU/GMU Runtime PM HFI 中断与内存序根治）**、撤销设备端保活规则并归档于 [development/milestones/P3_9/](development/milestones/P3_9/)。
+
+### 10.0-A P3.11 墙充限流与 VoocPHY 熔断修复 (`TASK-20261123-220715`, `PASS`)
+* **修复内容 (`drivers/power/supply/qcom_battmgr.c`)**：映射 `adap_type=9 -> APPLE_BRICK_ID`、`PD_SDP(17) -> PD`，提取公共 `qcom_battmgr_oplus_apply_adap_limits()`，并增加 `vooc_commu_failures >= 2` 熔断回落标准 `5V/2.0A` 状态机，归档至 [development/milestones/P3_11/](development/milestones/P3_11/)。
+* **实机 60s 墙充验收 (`boot_id`: `1f42788e-acce-4ddf-8d20-27f8af57d469`)**：识别 `wall brick adapter (type=9), setting 2.0A ICL/FCC` 并顺利协商 `PD_PPS` (`9V/3A`)，`usb.input_current_limit=2000000`，`bat.current_now=+666~+675mA`，零 `COMMU_TIME_OUT`，60 秒内电量 `16% -> 17%`。
 
 ### 10.0 P3.10 S2R (`deep` / `s2idle`) 与触控唤醒修复 (`TASK-20261123-000413`, `PASS`)
 * **根因与修复 (`drivers/input/touchscreen/synaptics_tcm.c`)**：`synaptics_tcm_resume()` 上电复位后未先执行 `identify_chip` / `get_fw_config`，且 `preserve_touch_report_config()` 未校验 `TCM_STATUS_OK (0x01)` 与排空异步 `REPORT_IDENTIFY`（28 字节），导致唤醒后覆盖开机时的 128 字节 `touch_config` 使触控失灵。修复后新增公共命令应答排空函数 `synaptics_tcm_read_cmd_resp()`、`identify_chip` 长度防护、`suspend()` 释放 `active_slots` 及 `resume()` 完整重初始化序列，构建并归档至 [development/milestones/P3_10/](development/milestones/P3_10/)。

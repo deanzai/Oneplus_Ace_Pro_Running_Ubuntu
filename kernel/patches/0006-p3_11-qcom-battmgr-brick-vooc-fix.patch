@@ -1,0 +1,440 @@
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 1356676a3..5f2a31faf 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -516,6 +516,8 @@ struct qcom_battmgr {
+         bool vooc_limits_set;
+         int last_configured_adap_type;  /* adapter type we last configured, -1 = none */
+         unsigned int usb_offline_count; /* consecutive USB_ONLINE=0 readings */
++        unsigned int vooc_commu_failures;
++        bool vooc_fallback_active;
+ 
+         /* ADSP told AP to suspend charging (notification 0x61) */
+         bool adsp_suspended_chg;
+@@ -2237,19 +2239,32 @@ static void qcom_battmgr_voocphy_status_worker(struct work_struct *work)
+                  raw, state_name, vooc_state, fast_chg_type, track_status);
+ 
+         /*
+-         * On error states (ERR_COMMU, COMMU_TIME_OUT, COMMU_CLK_ERR),
+-         * re-enable VoocPHY to retry the handshake — matching stock
+-         * behavior in oplus_adsp_voocphy_status_func().
++         * Circuit-break VoocPHY after consecutive communication errors
++         * (ERR_COMMU, COMMU_TIME_OUT, COMMU_CLK_ERR) and fall back to
++         * standard 5V/2A charging instead of looping forever.
+          */
+-        if (vooc_state == ADSP_VPHY_FAST_NOTIFY_ERR_COMMU ||
+-            vooc_state == ADSP_VPHY_FAST_NOTIFY_COMMU_TIME_OUT ||
+-            vooc_state == ADSP_VPHY_FAST_NOTIFY_COMMU_CLK_ERR) {
+-                dev_warn(battmgr->dev,
+-                         "vooc: communication error (%s), will re-enable VoocPHY\n",
+-                         state_name);
+-                battmgr->vooc_limits_set = false;
+-                battmgr->last_configured_adap_type = -1;
+-		power_supply_changed(battmgr->usb_psy);
++        if (vooc_state == ADSP_VPHY_FAST_NOTIFY_ONGOING) {
++                battmgr->vooc_commu_failures = 0;
++        } else if (vooc_state == ADSP_VPHY_FAST_NOTIFY_ERR_COMMU ||
++                   vooc_state == ADSP_VPHY_FAST_NOTIFY_COMMU_TIME_OUT ||
++                   vooc_state == ADSP_VPHY_FAST_NOTIFY_COMMU_CLK_ERR) {
++                battmgr->vooc_commu_failures++;
++                if (battmgr->vooc_commu_failures < 2) {
++                        dev_warn(battmgr->dev,
++                                 "vooc: communication error (%s), will re-enable VoocPHY\n",
++                                 state_name);
++                        battmgr->vooc_limits_set = false;
++                        battmgr->last_configured_adap_type = -1;
++                        power_supply_changed(battmgr->usb_psy);
++                } else if (!battmgr->vooc_fallback_active) {
++                        dev_info(battmgr->dev,
++                                 "vooc: %u consecutive communication errors (%s), falling back to standard 5V/2A charging\n",
++                                 battmgr->vooc_commu_failures, state_name);
++                        battmgr->vooc_fallback_active = true;
++                        battmgr->vooc_limits_set = false;
++                        battmgr->last_configured_adap_type = -1;
++                        power_supply_changed(battmgr->usb_psy);
++                }
+         }
+ 
+         power_supply_changed(battmgr->bat_psy);
+@@ -2272,6 +2287,139 @@ static void qcom_battmgr_voocphy_status_worker(struct work_struct *work)
+  * This matches the stock driver's crash recovery sequence:
+  *   oplus_ap_init_adsp_gague() → oplus_adsp_voocphy_enable(true)
+  */
++static void qcom_battmgr_oplus_apply_adap_limits(struct qcom_battmgr *battmgr,
++						 int adap_type,
++						 bool fallback_non_vooc)
++{
++	int ret;
++	int pdo_mv = 0;		/* 0 = don't change PDO */
++	int icl_ua = 500000;	/* default SDP 500mA */
++	int fcc_ua = 500000;	/* default SDP 500mA */
++	bool skip_fcc = false;
++
++	switch (adap_type) {
++	case POWER_SUPPLY_USB_TYPE_PD:
++	case POWER_SUPPLY_USB_TYPE_PD_DRP:
++	case POWER_SUPPLY_USB_TYPE_PD_PPS:
++	case POWER_SUPPLY_USB_TYPE_PD_SDP:
++		pdo_mv = 9000;
++		icl_ua = 3000000;
++		fcc_ua = 3000000;
++		dev_info(battmgr->dev,
++			 "oplus: PD/PPS adapter detected (type=%d), requesting 9V/3A\n",
++			 adap_type);
++		break;
++	case POWER_SUPPLY_USB_TYPE_DCP:
++		if (!fallback_non_vooc) {
++			pdo_mv = 0;
++			icl_ua = 7300000;
++			fcc_ua = 7300000;
++			skip_fcc = true;
++			dev_info(battmgr->dev,
++				 "oplus: DCP adapter detected, setting 7.3A ICL (VOOC/SuperVOOC)\n");
++		} else {
++			pdo_mv = 0;
++			icl_ua = 2000000;
++			fcc_ua = 2000000;
++			dev_info(battmgr->dev,
++				 "oplus: DCP adapter (VOOC fallback), setting 2.0A ICL/FCC\n");
++		}
++		break;
++	case 9:
++	case POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID:
++		pdo_mv = 0;
++		icl_ua = 2000000;
++		fcc_ua = 2000000;
++		dev_info(battmgr->dev,
++			 "oplus: wall brick adapter (type=%d), setting 2.0A ICL/FCC\n",
++			 adap_type);
++		break;
++	case POWER_SUPPLY_USB_TYPE_CDP:
++		pdo_mv = 0;
++		icl_ua = 1500000;
++		fcc_ua = 1500000;
++		dev_info(battmgr->dev,
++			 "oplus: CDP adapter detected, setting 1.5A ICL\n");
++		break;
++	case POWER_SUPPLY_USB_TYPE_C:
++		pdo_mv = 0;
++		icl_ua = 1500000;
++		fcc_ua = 2000000;
++		dev_info(battmgr->dev,
++			 "oplus: Type-C adapter detected, setting 1.5A ICL\n");
++		break;
++	case POWER_SUPPLY_USB_TYPE_SDP:
++	default:
++		pdo_mv = 0;
++		icl_ua = 500000;
++		fcc_ua = 500000;
++		dev_info(battmgr->dev,
++			 "oplus: SDP/unknown adapter (type=%d), using defaults\n",
++			 adap_type);
++		break;
++	}
++
++	/* Request higher voltage PDO if PD-capable */
++	if (pdo_mv > 0) {
++		mutex_lock(&battmgr->lock);
++		ret = qcom_battmgr_request_property(battmgr,
++						    BATTMGR_BAT_PROPERTY_SET,
++						    BATT_OPLUS_SET_PDO, pdo_mv);
++		mutex_unlock(&battmgr->lock);
++		if (ret)
++			dev_warn(battmgr->dev,
++				 "failed to set PDO %dmV: %d\n", pdo_mv, ret);
++		else
++			msleep(300); /* PD re-negotiation delay */
++	}
++
++	/* Set input current limit (after PDO switch) */
++	dev_info(battmgr->dev, "oplus: setting ICL to %d.%03dA\n",
++		 icl_ua / 1000000, (icl_ua % 1000000) / 1000);
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					    BATTMGR_USB_PROPERTY_SET,
++					    USB_INPUT_CURR_LIMIT, icl_ua);
++	mutex_unlock(&battmgr->lock);
++	if (ret)
++		dev_warn(battmgr->dev, "failed to set ICL: %d\n", ret);
++
++	/* Enable charging */
++	mutex_lock(&battmgr->lock);
++	ret = qcom_battmgr_request_property(battmgr,
++					    BATTMGR_BAT_PROPERTY_SET,
++					    BATT_OPLUS_CHG_EN, 1);
++	if (adap_type == POWER_SUPPLY_USB_TYPE_DCP && !fallback_non_vooc)
++		qcom_battmgr_request_property(battmgr,
++					      BATTMGR_USB_PROPERTY_SET,
++					      USB_OPLUS_VOOCPHY_ENABLE, 1);
++	mutex_unlock(&battmgr->lock);
++	if (ret)
++		dev_warn(battmgr->dev, "failed to enable charging: %d\n", ret);
++
++	/*
++	 * Set fast charge current unless in active DCP/VOOC mode, where
++	 * writing BATT_CHG_CTRL_LIM causes ADSP error 514.
++	 */
++	if (!skip_fcc) {
++		dev_info(battmgr->dev, "oplus: setting FCC to %d.%03dA\n",
++			 fcc_ua / 1000000, (fcc_ua % 1000000) / 1000);
++		mutex_lock(&battmgr->lock);
++		ret = qcom_battmgr_request_property(battmgr,
++						    BATTMGR_BAT_PROPERTY_SET,
++						    BATT_CHG_CTRL_LIM, fcc_ua);
++		mutex_unlock(&battmgr->lock);
++		if (ret)
++			dev_warn(battmgr->dev, "failed to set FCC: %d\n", ret);
++	} else {
++		dev_info(battmgr->dev,
++			 "oplus: DCP/VOOC mode — skipping FCC write (ADSP VoocPHY controls current)\n");
++	}
++
++	battmgr->last_configured_adap_type = adap_type;
++	battmgr->vooc_limits_set = true;
++}
++
+ static void qcom_battmgr_oplus_gauge_init(struct qcom_battmgr *battmgr)
+ {
+         int ret;
+@@ -2341,9 +2489,6 @@ static void qcom_battmgr_oplus_gauge_init(struct qcom_battmgr *battmgr)
+          */
+         {
+                 int adap_type;
+-                int pdo_mv = 0;    /* 0 = don't change PDO */
+-                int icl_ua = 500000;  /* default SDP 500mA */
+-                int fcc_ua = 500000;  /* default SDP 500mA */
+ 
+                 /* Query the adapter type from the ADSP */
+                 mutex_lock(&battmgr->lock);
+@@ -2358,118 +2503,8 @@ static void qcom_battmgr_oplus_gauge_init(struct qcom_battmgr *battmgr)
+                         adap_type = POWER_SUPPLY_USB_TYPE_PD;
+                 }
+ 
+-                switch (adap_type) {
+-                case POWER_SUPPLY_USB_TYPE_PD:
+-                case POWER_SUPPLY_USB_TYPE_PD_DRP:
+-                case POWER_SUPPLY_USB_TYPE_PD_PPS:
+-                case POWER_SUPPLY_USB_TYPE_PD_SDP:
+-                        pdo_mv = 9000;
+-                        icl_ua = 3000000;
+-                        fcc_ua = 3000000;
+-                        dev_info(battmgr->dev,
+-                                 "oplus: PD/PPS adapter detected (type=%d), requesting 9V/3A\n",
+-                                 adap_type);
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_DCP:
+-                        /*
+-                         * DCP: no PD negotiation. Set high ICL/FCC because
+-                         * VOOC/SuperVOOC chargers present as DCP to BC1.2.
+-                         * The ADSP VoocPHY handles the proprietary handshake
+-                         * and regulates current internally — low Linux-side
+-                         * limits starve the VoocPHY and block fast charging.
+-                         */
+-                        pdo_mv = 0;
+-                        icl_ua = 7300000;
+-                        fcc_ua = 7300000;
+-                        dev_info(battmgr->dev,
+-                                 "oplus: DCP adapter detected, setting 7.3A ICL (VOOC/SuperVOOC)\n");
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_CDP:
+-                        pdo_mv = 0;
+-                        icl_ua = 1500000;
+-                        fcc_ua = 1500000;
+-                        dev_info(battmgr->dev,
+-                                 "oplus: CDP adapter detected, setting 1.5A ICL\n");
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_C:
+-                        pdo_mv = 0;
+-                        icl_ua = 1500000;
+-                        fcc_ua = 2000000;
+-                        dev_info(battmgr->dev,
+-                                 "oplus: Type-C adapter detected, setting 1.5A ICL\n");
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_SDP:
+-                default:
+-                        pdo_mv = 0;
+-                        icl_ua = 500000;
+-                        fcc_ua = 500000;
+-                        dev_info(battmgr->dev,
+-                                 "oplus: SDP/unknown adapter (type=%d), using defaults\n",
+-                                 adap_type);
+-                        break;
+-                }
+-
+-                /* Step 5a: Request higher voltage PDO if PD-capable */
+-                if (pdo_mv > 0) {
+-                        mutex_lock(&battmgr->lock);
+-                        ret = qcom_battmgr_request_property(battmgr,
+-                                        BATTMGR_BAT_PROPERTY_SET,
+-                                        BATT_OPLUS_SET_PDO, pdo_mv);
+-                        mutex_unlock(&battmgr->lock);
+-                        if (ret)
+-                                dev_warn(battmgr->dev,
+-                                         "failed to set PDO %dmV: %d\n",
+-                                         pdo_mv, ret);
+-                        else
+-                                msleep(300); /* PD re-negotiation delay */
+-                }
+-
+-                /* Step 6: Set input current limit (after PDO switch) */
+-                dev_info(battmgr->dev,
+-                         "oplus: setting ICL to %d.%03dA\n",
+-                         icl_ua / 1000000, (icl_ua % 1000000) / 1000);
+-                mutex_lock(&battmgr->lock);
+-                ret = qcom_battmgr_request_property(battmgr,
+-                                BATTMGR_USB_PROPERTY_SET,
+-                                USB_INPUT_CURR_LIMIT, icl_ua);
+-                mutex_unlock(&battmgr->lock);
+-                if (ret)
+-                        dev_warn(battmgr->dev,
+-                                 "failed to set ICL: %d\n", ret);
+-
+-                /* Step 7: Enable charging */
+-                mutex_lock(&battmgr->lock);
+-                ret = qcom_battmgr_request_property(battmgr,
+-                                BATTMGR_BAT_PROPERTY_SET,
+-                                BATT_OPLUS_CHG_EN, 1);
+-                mutex_unlock(&battmgr->lock);
+-                if (ret)
+-                        dev_warn(battmgr->dev,
+-                                 "failed to enable charging: %d\n", ret);
+-
+-                /*
+-                 * Step 8: Set fast charge current.
+-                 * Skip for DCP — VOOC/SuperVOOC chargers present as DCP,
+-                 * and the ADSP VoocPHY controls charging current autonomously.
+-                 * Writing BATT_CHG_CTRL_LIM during VOOC causes ADSP error 514.
+-                 */
+-                if (adap_type != POWER_SUPPLY_USB_TYPE_DCP) {
+-                        dev_info(battmgr->dev,
+-                                 "oplus: setting FCC to %d.%03dA\n",
+-                                 fcc_ua / 1000000, (fcc_ua % 1000000) / 1000);
+-                        mutex_lock(&battmgr->lock);
+-                        ret = qcom_battmgr_request_property(battmgr,
+-                                        BATTMGR_BAT_PROPERTY_SET,
+-                                        BATT_CHG_CTRL_LIM, fcc_ua);
+-                        mutex_unlock(&battmgr->lock);
+-                        if (ret)
+-                                dev_warn(battmgr->dev,
+-                                         "failed to set FCC: %d\n", ret);
+-                } else {
+-                        dev_info(battmgr->dev,
+-                                 "oplus: DCP/VOOC mode — skipping FCC write (ADSP VoocPHY controls current)\n");
+-                }
+-                battmgr->last_configured_adap_type = adap_type;
++                qcom_battmgr_oplus_apply_adap_limits(battmgr, adap_type,
++                                                     battmgr->vooc_fallback_active);
+         }
+ 
+         battmgr->gauge_init_done = true;
+@@ -2552,6 +2587,8 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
+                         battmgr->vooc_limits_set = false;
+                         battmgr->adsp_suspended_chg = false;
+                         battmgr->last_configured_adap_type = -1;
++                        battmgr->vooc_commu_failures = 0;
++                        battmgr->vooc_fallback_active = false;
+                 }
+                 goto reschedule;
+         }
+@@ -2588,89 +2625,8 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
+                 battmgr->vooc_limits_set = false;
+ 
+         if (!battmgr->vooc_limits_set) {
+-                int pdo_mv = 0;
+-                int icl_ua = 500000;
+-                int fcc_ua = 500000;
+-
+-                switch (adap_type) {
+-                case POWER_SUPPLY_USB_TYPE_PD:
+-                case POWER_SUPPLY_USB_TYPE_PD_DRP:
+-                case POWER_SUPPLY_USB_TYPE_PD_PPS:
+-                case POWER_SUPPLY_USB_TYPE_PD_SDP:
+-                        pdo_mv = 9000;
+-                        icl_ua = 3000000;
+-                        fcc_ua = 3000000;
+-                        dev_info(battmgr->dev,
+-                                "voocphy recheck: PD adapter (type=%d), requesting 9V/3A\n",
+-                                adap_type);
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_DCP:
+-                        icl_ua = 7300000;
+-                        fcc_ua = 7300000;
+-                        dev_info(battmgr->dev,
+-                                "voocphy recheck: DCP detected, setting 7.3A ICL (VOOC/SuperVOOC)\n");
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_CDP:
+-                        icl_ua = 1500000;
+-                        fcc_ua = 1500000;
+-                        dev_info(battmgr->dev,
+-                                "voocphy recheck: CDP detected, setting 1.5A ICL\n");
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_C:
+-                        icl_ua = 1500000;
+-                        fcc_ua = 2000000;
+-                        dev_info(battmgr->dev,
+-                                "voocphy recheck: Type-C detected, setting 1.5A ICL\n");
+-                        break;
+-                case POWER_SUPPLY_USB_TYPE_SDP:
+-                default:
+-                        dev_info(battmgr->dev,
+-                                "voocphy recheck: SDP/unknown (type=%d), using defaults\n",
+-                                adap_type);
+-                        break;
+-                }
+-
+-                /* Request higher voltage PDO if PD-capable */
+-                if (pdo_mv > 0) {
+-                        mutex_lock(&battmgr->lock);
+-                        ret = qcom_battmgr_request_property(battmgr,
+-                                        BATTMGR_BAT_PROPERTY_SET,
+-                                        BATT_OPLUS_SET_PDO, pdo_mv);
+-                        mutex_unlock(&battmgr->lock);
+-                        if (ret)
+-                                dev_warn(battmgr->dev,
+-                                        "recheck: failed to set PDO %dmV: %d\n",
+-                                        pdo_mv, ret);
+-                        else
+-                                msleep(300); /* PD re-negotiation delay */
+-                }
+-
+-                /* Set ICL */
+-                mutex_lock(&battmgr->lock);
+-                qcom_battmgr_request_property(battmgr,
+-                                BATTMGR_USB_PROPERTY_SET,
+-                                USB_INPUT_CURR_LIMIT, icl_ua);
+-                /* Enable charging */
+-                qcom_battmgr_request_property(battmgr,
+-                                BATTMGR_BAT_PROPERTY_SET,
+-                                BATT_OPLUS_CHG_EN, 1);
+-                /* Enable VoocPHY (needed for DCP/VOOC) */
+-                qcom_battmgr_request_property(battmgr,
+-                                BATTMGR_USB_PROPERTY_SET,
+-                                USB_OPLUS_VOOCPHY_ENABLE, 1);
+-                mutex_unlock(&battmgr->lock);
+-
+-                /* Set FCC (skip for DCP — VoocPHY controls current) */
+-                if (adap_type != POWER_SUPPLY_USB_TYPE_DCP) {
+-                        mutex_lock(&battmgr->lock);
+-                        qcom_battmgr_request_property(battmgr,
+-                                        BATTMGR_BAT_PROPERTY_SET,
+-                                        BATT_CHG_CTRL_LIM, fcc_ua);
+-                        mutex_unlock(&battmgr->lock);
+-                }
+-
+-                battmgr->vooc_limits_set = true;
+-                battmgr->last_configured_adap_type = adap_type;
++                qcom_battmgr_oplus_apply_adap_limits(battmgr, adap_type,
++                                                     battmgr->vooc_fallback_active);
+ 
+ 		/* Notify userspace so upower re-reads battery status */
+ 		power_supply_changed(battmgr->bat_psy);
+@@ -2680,7 +2636,8 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
+         }
+ 
+         /* Subsequent cycles for DCP: re-enable VoocPHY (stock behavior) */
+-        if (adap_type == POWER_SUPPLY_USB_TYPE_DCP) {
++        if (adap_type == POWER_SUPPLY_USB_TYPE_DCP &&
++            !battmgr->vooc_fallback_active) {
+                 mutex_lock(&battmgr->lock);
+                 ret = qcom_battmgr_request_property(battmgr,
+                                 BATTMGR_USB_PROPERTY_SET,

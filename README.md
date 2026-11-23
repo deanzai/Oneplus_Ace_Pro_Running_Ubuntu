@@ -2,7 +2,7 @@
 
 > [!CAUTION]
 > **⚠️ 仅限测试与研究使用，禁止用于正式生产环境（FOR TESTING & RESEARCH ONLY — NOT FOR PRODUCTION USE）**  
-> 本仓库整理自一加 Ace Pro (SM8475 / `ovaltine`) 主线 Linux `7.3.0-rc4` 移植实验（P3.10 基线），包含内核配置、设备树、增量补丁、用户态 systemd/udev/显示脚本及工程文档。刷写内核与模块存在变砖风险，操作前请务必保留原厂分区与 Slot `_b` 备份。
+> 本仓库整理自一加 Ace Pro (SM8475 / `ovaltine`) 主线 Linux `7.3.0-rc4` 移植实验（P3.11 基线），包含内核配置、设备树、增量补丁、用户态 systemd/udev/显示脚本及工程文档。刷写内核与模块存在变砖风险，操作前请务必保留原厂分区与 Slot `_b` 备份。
 
 ---
 
@@ -15,7 +15,7 @@
 - **S2R 休眠唤醒 (`deep` & `s2idle`)**：`systemctl suspend` 下 3 轮 `deep` + 1 轮 `s2idle` 验证通过，电源键单次唤醒/熄屏、触控、Wi-Fi、GPU/GMU 与音频恢复正常。
 - **Wi-Fi 6E / 蓝牙 5.2**：WCN6855 (`ath11k_pci` + `hci_uart`)。
 - **USB Gadget & Type-C**：HS-only DTB 裁剪（`gcc_usb3_prim_phy_pipe_clk` 收敛 `0/0`），支持 NCM/RNDIS + ACM（默认 USB 调试网口 `172.16.42.1/24`）。
-- **音频与电池**：WCD9385 + 双路 TFA9874 立体声扬声器 + `qcom_battmgr`（已静默 enum 9 中断风暴，支持标准 USB-PD 充电）。
+- **音频与电池**：WCD9385 + 双路 TFA9874 立体声扬声器 + `qcom_battmgr`（已修复 enum 9 中断风暴、墙充 `type=9` 2.0A 限流及 VoocPHY `COMMU_TIME_OUT` 熔断回落，支持标准 USB-PD 充电）。
 
 ## 2. 未处理 / 暂缓模块与已知限制
 
@@ -44,10 +44,10 @@
 │   ├── PROJECT_HANDOVER_GUIDE.md   # 脱敏版工程指导手册 (v2.3)
 │   └── MILESTONES_SUMMARY.md       # P3.8 / P3.9 / P3.10 里程碑与验收摘要
 ├── kernel/
-│   ├── configs/ovaltine_p3_10.config
+│   ├── configs/ovaltine_p3_11.config
 │   ├── dts/{sm8475-oneplus-ovaltine.dts,sm8475-ovaltine.dtso}
 │   ├── drivers/panel-boe-rm692e5.c
-│   └── patches/                    # 按 0001 -> 0005 顺序应用到 Linux 7.3-rc4 (6d6be0ba1)
+│   └── patches/                    # 按 0001 -> 0006 顺序应用到 Linux 7.3-rc4 (6d6be0ba1)
 └── rootfs/
     ├── etc/{phosh/phoc.ini,systemd/system/*.service,udev/rules.d/90-acepro-input.rules}
     └── usr/local/{bin/acepro-display-sync.py,sbin/*.sh}
@@ -64,7 +64,7 @@
    ```bash
    for p in kernel/patches/000*.patch; do git -C <LINUX_SRC> apply "$p"; done
    ```
-3. 使用 `kernel/configs/ovaltine_p3_10.config` 作为 `.config`，设置 `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=` 编译内核镜像、`dtbs` 与 `modules`。
+3. 使用 `kernel/configs/ovaltine_p3_11.config` 作为 `.config`，设置 `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=` 编译内核镜像、`dtbs` 与 `modules`。
 
 > [!WARNING]
 > **双槽位安全红线**：本移植仅在 **Slot `_a`**（`boot_a` / `vendor_boot_a` / `dtbo_a`）调试，**严禁刷写或修改 Slot `_b`**（保留出厂系统作为急救回退）。

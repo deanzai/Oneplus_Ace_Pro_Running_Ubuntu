@@ -1,4 +1,4 @@
-# 里程碑交付摘要（P3.8 / P3.9 / P3.10）
+# 里程碑交付摘要（P3.8 / P3.9 / P3.10 / P3.11）
 
 > [!CAUTION]
 > **仅限测试与研究使用，不作正式环境使用（FOR TESTING & RESEARCH ONLY — NOT FOR PRODUCTION USE）**。
@@ -10,6 +10,7 @@
 | **P3.8** | R3 USB HS-only DTB + R1 显示 DSI PHY AHB `prepare` 生命周期修复 | `0002-p3_9-r3-usb-hs-only-dts.patch`<br>`0003-p3_9-r1-dsi-phy-ahb-lifecycle.patch` | `46f3e08d50219db1b13ad32234c27335824c9c202a3eb7b6897843b2c3064fb6`<br>`10937844d732cac903d6e654f85c6a70e401896f5f597517cbb3241e5cb01a61` |
 | **P3.9** | R2 GPU/GMU HFI IRQ 掩码过滤、posted-write readback 与 `dma_rmb()` 修复；撤销系统侧保活规则，恢复默认 `PM: auto` | `0004-p3_9-r2-gmu-hfi-irq-memory-order.patch`<br>`msm.ko` | `260da0675a2732bc78e54658753eee6037e30a3aac43943562002a5770093f05`<br>`344a525b701afcb0a4f7765e93bbedb45db591e26b0d4f979b0d5f7f508990c2` |
 | **P3.10** | S2R (`deep` / `s2idle`) 休眠唤醒后 `synaptics_tcm` 触控重初始化与命令应答排空修复 | `0005-p3_10-s2r-synaptics-tcm-resume.patch`<br>`synaptics_tcm.ko` | `f883399c84be0cdbd7403ab31d2465e6f063a8ac1f53203b16a860cc82b737e3`<br>`4ad831e30716429a28d4d1f8c3d8fe20521f380ba63a0ed7db6097be488b6eba` |
+| **P3.11** | `qcom_battmgr` 墙充 `type=9` 限流映射与 `COMMU_TIME_OUT >= 2` VoocPHY 熔断回落标准 `5V/2A` 修复 | `0006-p3_11-qcom-battmgr-brick-vooc-fix.patch`<br>`qcom_battmgr.ko` | `27e72dfe04b569887156ef1a58ae900a18417bb07c16b084c0439f7ed817783a` (`qcom_battmgr.ko`) |
 
 ## 2. P3.10 S2R 4 轮实机验收矩阵 (`PASS`)
 
