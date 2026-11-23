@@ -1,10 +1,10 @@
 # 一加 Ace Pro (PGP110 / ovaltine) 主线 Linux 移植完整工程指导手册
 
-> **文档版本**：v2.5 (P3.12 里程碑归档：Wi-Fi 固定静态 IP + `qcom_battmgr` PD/PPS PDO 解析与阶梯 AICL 优化)  
-> **更新时间**：2026-11-23  
+> **文档版本**：v2.6 (P3.13 里程碑归档：未插电黑屏自动 `deep` 休眠 + `qcom_battmgr` `mAh`/`uAh` 满充容量导出修复)  
+> **更新时间**：2026-11-24  
 > **目标系统**：Ubuntu Desktop / Phosh Mobile Linux (Linux 7.3.0-rc4 mainline)  
 > **目标机型**：一加 Ace Pro (OnePlus Ace Pro / PGP110 / 内部代号 `ovaltine` / 项目代号 `21841`)  
-> **当前实机运行版本**：**P3.12 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.12 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`、Wi-Fi 静态 IP `<STATIC_IP>/24`，实机验证 `boot_id`: `42bafa8f-6819-48a3-8993-b44712076973`；归档路径：[development/milestones/P3_12/](file://<WORKSPACE>/development/milestones/P3_12/)）
+> **当前实机运行版本**：**P3.13 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.13 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`、Wi-Fi 静态 IP `<STATIC_IP>/24`、未插电熄屏 180s 自动 `deep` 休眠，实机验证 `boot_id`: `e3f798d8-e597-41ea-8ce2-4d5d9fd1bccf`；归档路径：[development/milestones/P3_13/](file://<WORKSPACE>/development/milestones/P3_13/)）
 
 ---
 
@@ -377,6 +377,16 @@ P3.8 围绕 **R3（USB HS-only）** 与 **R1（显示 DSI PHY AHB `prepare` 生�
 ### 10.0 P3.10 S2R (`deep` / `s2idle`) 与触控唤醒修复 (`TASK-20261123-000413`, `PASS`)
 * **根因与修复 (`drivers/input/touchscreen/synaptics_tcm.c`)**：`synaptics_tcm_resume()` 上电复位后未先执行 `identify_chip` / `get_fw_config`，且 `preserve_touch_report_config()` 未校验 `TCM_STATUS_OK (0x01)` 与排空异步 `REPORT_IDENTIFY`（28 字节），导致唤醒后覆盖开机时的 128 字节 `touch_config` 使触控失灵。修复后新增公共命令应答排空函数 `synaptics_tcm_read_cmd_resp()`、`identify_chip` 长度防护、`suspend()` 释放 `active_slots` 及 `resume()` 完整重初始化序列，构建并归档至 [development/milestones/P3_10/](file://<WORKSPACE>/development/milestones/P3_10/)。
 * **实机 4 轮验收 (`boot_id`: `0d115116-2a2e-4642-be35-2f3d8299ba8b`)**：连续完成 3 轮 `deep` (`WIFI=enabled` / `disabled` / `enabled`) + 1 轮 `s2idle` (`WIFI=enabled`) `systemctl suspend` 休眠唤醒（`suspend_stats`: `success=4, fail=0`），单次电源键亮/熄屏、触控滑动解锁（`128 bytes`）、`wlp1s0` 重连、`es2gears_wayland` + GPU/GMU `auto` 挂起与声卡均正常。
+
+### 10.0-C P3.13 未插电黑屏自动 `deep` 休眠与 `qcom_battmgr` 满充容量修复 (`TASK-20261124-000500`, `PASS`)
+* **根因定位**：
+  1. `/proc/device-tree/hypervisor/compatible`（`qcom,gunyah-hypervisor-1.0`）导致 `systemd-detect-virt` / `systemd1.Manager.Virtualization` 返回 `"vm-other"`，`gsd-power`（`gnome-settings-daemon 46.0`）命中 `"Ignoring sleep timeout with suspend action inside VM"` 从而彻底屏蔽 `sleep-inactive-battery-type='suspend'`，使黑屏整机持续清醒耗电 ~2.6W（4 小时掉电 83%→0%）。
+  2. `qcom_battmgr.c` 在 SM8350/SM8550 probe 分支未初始化 `battmgr->unit`（保持 `0=mWh`），导致 `CHARGE_FULL`/`CHARGE_FULL_DESIGN` 恒返回 `-ENODATA`，且 `OEM_BUF_FCC`/`OEM_BUF_CHARGE_COUNTER` 以 `mAh` 上报，致使 `upowerd` 看到 `0 Wh` 并持续输出 `value "nan" ... property 'percentage'`（6 小时消耗 3m10s CPU）。
+* **修复方案（[development/milestones/P3_13/](file://<WORKSPACE>/development/milestones/P3_13/)）**：
+  1. **内核 (`p3_13_qcom_battmgr_unit_mah.patch`)**：SM8350/SM8550 probe 初始化 `battmgr->unit = QCOM_BATTMGR_UNIT_mAh`，并对 `mAh` 值（`>0 && <20000`）统一换算为 `uAh`（`* 1000`）。
+  2. **用户态休眠守护 (`/usr/local/sbin/acepro-idle-suspend.py` + `acepro-idle-suspend.service`)**：保留 DT `/hypervisor` 与 `acepro-pcie-aspm.service`（保护 WCN6855），开启 `sm.puri.phosh enable-suspend=true` 与 `sleep-inactive-battery-timeout=180`；仅在 `UPower.OnBattery=true` 且 `usb/wls online=0`、屏幕熄灭空闲 `>=180s`、无 `block sleep` inhibitor 且过 `45s` 唤醒/亮屏冷却期后调用 `login1.Manager.Suspend(false)` 进入 `deep` 休眠。
+  3. **辅助日志降噪 (`/usr/local/bin/acepro-display-sync.py`)**：当目标模式未变化时跳过写 `/etc/phosh/phoc.ini.tmp`，消除 `Permission denied` 报错。
+* **实机验收 (`boot_id`: `e3f798d8-e597-41ea-8ce2-4d5d9fd1bccf`)**：`qcom_battmgr.ko` (`8fc2d72a...95e9`) 导出 `charge_full=1687000`、`charge_full_design=4000000`、`charge_counter=1044000`；`upower -d` 正常显示 `energy-full=7.08~7.15 Wh`、`energy-full-design=16.80~16.95 Wh`，`upowerd` `nan` 报错 `0` 条、`acepro-display-sync.py` 权限报错 `0` 条；`systemctl suspend` 实测进入 `PM: suspend entry (deep)` 并通过短按电源键正常唤醒（`suspend_stats/success=1, fail=0`），`PrepareForSleep(false)` 45s 冷却与 `systemd-inhibit --mode=block` 识别自检均通过。
 
 ### 10.1 P3.9-R2 已完成实机验收项 (`TASK-20261120-010302`, `PASS`)
 * **根因修复**：在 `a6xx_gmu.c` 与 `a6xx_hfi.c` 修复 `a6xx_hfi_irq()`/`a6xx_gmu_irq()` 掩码过滤与 `IRQ_NONE` 返回、`a6xx_gmu_irq_disable()`/`a6xx_gmu_resume()` posted-write readback 刷新、`a6xx_hfi_queue_read()` `dma_rmb()` 与 `a6xx_hfi_wait_for_msg_interrupt()` `rspq` 非空轮询。

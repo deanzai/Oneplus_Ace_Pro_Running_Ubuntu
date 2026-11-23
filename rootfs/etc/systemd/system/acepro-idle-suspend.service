@@ -1,0 +1,13 @@
+[Unit]
+Description=Ace Pro Battery Idle Auto-Suspend Daemon
+After=upower.service systemd-logind.service phosh.service
+Wants=upower.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/acepro-idle-suspend.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -64,6 +64,9 @@ def update_phoc_ini(mode_str):
             new_lines.append(f"mode = {mode_str}\n")
             mode_set = True
         
+        if new_lines == lines:
+            return True
+
         tmp_file = PHOC_INI + ".tmp"
         with open(tmp_file, "w") as f:
             f.writelines(new_lines)

@@ -1,0 +1,43 @@
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 018fca38a..b9b3d605c 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -692,7 +692,13 @@ static void qcom_battmgr_apply_oem_data(struct qcom_battmgr *battmgr)
+         battmgr->status.voltage_now = battmgr->oem_read_buf[OEM_BUF_VOLTAGE];
+         battmgr->info.cycle_count = battmgr->oem_read_buf[OEM_BUF_CYCLE_COUNT];
+         battmgr->info.last_full_capacity = battmgr->oem_read_buf[OEM_BUF_FCC];
++        if (battmgr->info.last_full_capacity > 0 &&
++            battmgr->info.last_full_capacity < 20000)
++                battmgr->info.last_full_capacity *= 1000;
+         battmgr->info.charge_count = battmgr->oem_read_buf[OEM_BUF_CHARGE_COUNTER];
++        if (battmgr->info.charge_count > 0 &&
++            battmgr->info.charge_count < 20000)
++                battmgr->info.charge_count *= 1000;
+         battmgr->status.soh_percent = battmgr->oem_read_buf[OEM_BUF_SOH];
+ }
+ 
+@@ -2046,9 +2052,15 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 			break;
+ 		case BATT_CHG_FULL_DESIGN:
+ 			battmgr->info.design_capacity = le32_to_cpu(resp->intval.value);
++			if (battmgr->info.design_capacity > 0 &&
++			    battmgr->info.design_capacity < 20000)
++				battmgr->info.design_capacity *= 1000;
+ 			break;
+ 		case BATT_CHG_FULL:
+ 			battmgr->info.last_full_capacity = le32_to_cpu(resp->intval.value);
++			if (battmgr->info.last_full_capacity > 0 &&
++			    battmgr->info.last_full_capacity < 20000)
++				battmgr->info.last_full_capacity *= 1000;
+ 			break;
+ 		case BATT_MODEL_NAME:
+ 			strscpy(battmgr->info.model_number, resp->strval.model, BATTMGR_STRING_LEN);
+@@ -3053,6 +3065,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
+ 					     "failed to register wireless charing power supply\n");
+ 	} else {
++		battmgr->unit = QCOM_BATTMGR_UNIT_mAh;
++
+ 		if (battmgr->variant == QCOM_BATTMGR_SM8550)
+ 			psy_desc = &sm8550_bat_psy_desc;
+ 		else
