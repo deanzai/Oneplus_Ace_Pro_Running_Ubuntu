@@ -1,10 +1,10 @@
 # 一加 Ace Pro (PGP110 / ovaltine) 主线 Linux 移植完整工程指导手册
 
-> **文档版本**：v2.6 (P3.13 里程碑归档：未插电黑屏自动 `deep` 休眠 + `qcom_battmgr` `mAh`/`uAh` 满充容量导出修复)  
+> **文档版本**：v2.7 (P3.14 里程碑归档：`qcom_battmgr` 异步 OEM 缓存消除 450ms sysfs 阻塞，恢复 `lxc-webui` 功率显示)  
 > **更新时间**：2026-11-24  
 > **目标系统**：Ubuntu Desktop / Phosh Mobile Linux (Linux 7.3.0-rc4 mainline)  
 > **目标机型**：一加 Ace Pro (OnePlus Ace Pro / PGP110 / 内部代号 `ovaltine` / 项目代号 `21841`)  
-> **当前实机运行版本**：**P3.13 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.13 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`、Wi-Fi 静态 IP `<STATIC_IP>/24`、未插电熄屏 180s 自动 `deep` 休眠，实机验证 `boot_id`: `e3f798d8-e597-41ea-8ce2-4d5d9fd1bccf`；归档路径：[development/milestones/P3_13/](file://<WORKSPACE>/development/milestones/P3_13/)）
+> **当前实机运行版本**：**P3.14 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.14 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`、Wi-Fi 静态 IP `<STATIC_IP>/24`、未插电熄屏 180s 自动 `deep` 休眠、电池 sysfs 读取耗时 `0.03~33ms`，实机验证 `boot_id`: `79be0688-0b00-4dd2-b2b7-6327a8dda132`；归档路径：[development/milestones/P3_14/](file://<WORKSPACE>/development/milestones/P3_14/)）
 
 ---
 
@@ -387,6 +387,13 @@ P3.8 围绕 **R3（USB HS-only）** 与 **R1（显示 DSI PHY AHB `prepare` 生�
   2. **用户态休眠守护 (`/usr/local/sbin/acepro-idle-suspend.py` + `acepro-idle-suspend.service`)**：保留 DT `/hypervisor` 与 `acepro-pcie-aspm.service`（保护 WCN6855），开启 `sm.puri.phosh enable-suspend=true` 与 `sleep-inactive-battery-timeout=180`；仅在 `UPower.OnBattery=true` 且 `usb/wls online=0`、屏幕熄灭空闲 `>=180s`、无 `block sleep` inhibitor 且过 `45s` 唤醒/亮屏冷却期后调用 `login1.Manager.Suspend(false)` 进入 `deep` 休眠。
   3. **辅助日志降噪 (`/usr/local/bin/acepro-display-sync.py`)**：当目标模式未变化时跳过写 `/etc/phosh/phoc.ini.tmp`，消除 `Permission denied` 报错。
 * **实机验收 (`boot_id`: `e3f798d8-e597-41ea-8ce2-4d5d9fd1bccf`)**：`qcom_battmgr.ko` (`8fc2d72a...95e9`) 导出 `charge_full=1687000`、`charge_full_design=4000000`、`charge_counter=1044000`；`upower -d` 正常显示 `energy-full=7.08~7.15 Wh`、`energy-full-design=16.80~16.95 Wh`，`upowerd` `nan` 报错 `0` 条、`acepro-display-sync.py` 权限报错 `0` 条；`systemctl suspend` 实测进入 `PM: suspend entry (deep)` 并通过短按电源键正常唤醒（`suspend_stats/success=1, fail=0`），`PrepareForSleep(false)` 45s 冷却与 `systemd-inhibit --mode=block` 识别自检均通过。
+
+### 10.0-D P3.14 `qcom_battmgr` 异步 OEM 缓存消除 450ms sysfs 阻塞 (`TASK-20261124-004500`, `PASS`)
+* **根因定位**：`qcom_battmgr_bat_sm8350_update()` 每次读取任意电池 sysfs 属性时均同步执行 `BATTMGR_BAT_PROPERTY_GET` (~28ms) 与 `qcom_battmgr_oem_read_buffer()`（`0x10000` 256B ADSP 电量计缓冲读取，耗时 ~350–450ms），导致 `status`/`voltage_now`/`current_now`/`capacity`/`charge_full` 单次读取耗时高达 **`356.45–672.11 ms`**，超过 `/opt/lxc-webui/lxc-webui` `readDevicePower` 的 **300 ms** 硬超时阈值并触发路径黑名单（`power_w=0`）。
+* **修复方案（[development/milestones/P3_14/](file://<WORKSPACE>/development/milestones/P3_14/)，`p3_14_qcom_battmgr_async_oem_cache.patch`）**：
+  1. 引入 `oem_read_work`（`devm_work_autocancel` 托管）与 `oem_last_update`：在 `qcom_battmgr_enable_worker()` 初始化时先拉取一次填满 `oem_read_buf`，后续在 `bat_sm8350_update()` 中当缓存超过 `2000 ms` 时异步 `schedule_work(&battmgr->oem_read_work)` 后台刷新，移除 sysfs 同步读路径上的 450ms 等待。
+  2. 新增 `qcom_battmgr_prop_from_oem()`：当 `oem_read_buf_valid` 为真时，对由 `oem_read_buf` 提供的属性（`VOLTAGE_NOW`、`CAPACITY`、`TEMP`、`CYCLE_COUNT`、`CHARGE_FULL`、`CHARGE_COUNTER`、`STATE_OF_HEALTH` 及 `!usb.online` 下的 `CURRENT_NOW`）直接走内存缓存，跳过冗余 `BATTMGR_BAT_PROPERTY_GET`。
+* **实机验收 (`boot_id`: `79be0688-0b00-4dd2-b2b7-6327a8dda132`)**：部署 `qcom_battmgr.ko` (`126d536b...11d4`) 后，`qcom-battmgr-bat` 实测单次读取耗时降至 `type=0.10ms`、`status=2.47ms`、`voltage_now=0.06ms`、`current_now=33.02ms`、`capacity=0.04ms`、`charge_full=0.03ms`、`charge_full_design=0.39ms`、`charge_counter=0.05ms`，`qcom-battmgr-usb` `online=32.41ms`、`voltage_now=3.78ms`、`current_now=5.95ms`（全部 **`< 50 ms`**，远低于 `lxc-webui` 300ms 阈值，实测输入功率 `9.362 W`、电池充电功率 `2.062 W`）；`thermal_zone0=44.0°C`、`thermal_zone1=46.7°C`，`vmstat` 稳态 `99% idle`，`UPOWER_NAN_COUNT=0`。
 
 ### 10.1 P3.9-R2 已完成实机验收项 (`TASK-20261120-010302`, `PASS`)
 * **根因修复**：在 `a6xx_gmu.c` 与 `a6xx_hfi.c` 修复 `a6xx_hfi_irq()`/`a6xx_gmu_irq()` 掩码过滤与 `IRQ_NONE` 返回、`a6xx_gmu_irq_disable()`/`a6xx_gmu_resume()` posted-write readback 刷新、`a6xx_hfi_queue_read()` `dma_rmb()` 与 `a6xx_hfi_wait_for_msg_interrupt()` `rspq` 非空轮询。

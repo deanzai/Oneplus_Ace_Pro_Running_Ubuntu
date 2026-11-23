@@ -1,0 +1,107 @@
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index b9b3d605c..bbcf94a1b 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -509,6 +509,8 @@ struct qcom_battmgr {
+         bool oem_read_buf_valid;
+         bool oem_read_buf_supported;
+         bool oem_read_buf_tried;
++        unsigned long oem_last_update;
++        struct work_struct oem_read_work;
+         u32 oem_read_buf[OEM_READ_BUF_MAX];
+         u32 pps_read_buf[OEM_READ_BUF_MAX];
+         bool pps_read_buf_valid;
+@@ -703,11 +705,49 @@ static void qcom_battmgr_apply_oem_data(struct qcom_battmgr *battmgr)
+ }
+ 
+ 
++static void qcom_battmgr_oem_read_worker(struct work_struct *work)
++{
++	struct qcom_battmgr *battmgr =
++		container_of(work, struct qcom_battmgr, oem_read_work);
++
++	if (!battmgr->service_up)
++		return;
++
++	if (!qcom_battmgr_oem_read_buffer(battmgr)) {
++		battmgr->oem_last_update = jiffies;
++		mutex_lock(&battmgr->lock);
++		qcom_battmgr_apply_oem_data(battmgr);
++		mutex_unlock(&battmgr->lock);
++	}
++}
++
++static bool qcom_battmgr_prop_from_oem(struct qcom_battmgr *battmgr,
++				       enum power_supply_property psp)
++{
++	if (!battmgr->oem_read_buf_valid)
++		return false;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CAPACITY:
++	case POWER_SUPPLY_PROP_TEMP:
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++	case POWER_SUPPLY_PROP_CYCLE_COUNT:
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
++	case POWER_SUPPLY_PROP_STATE_OF_HEALTH:
++		return true;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		return !battmgr->usb.online;
++	default:
++		return false;
++	}
++}
++
+ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
+ 					  enum power_supply_property psp)
+ {
+ 	unsigned int prop;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (psp >= ARRAY_SIZE(sm8350_bat_prop_map))
+ 		return -EINVAL;
+@@ -715,13 +755,17 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
+ 	prop = sm8350_bat_prop_map[psp];
+ 
+ 	mutex_lock(&battmgr->lock);
+-	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
++	if (!qcom_battmgr_prop_from_oem(battmgr, psp))
++		ret = qcom_battmgr_request_property(battmgr,
++						    BATTMGR_BAT_PROPERTY_GET,
++						    prop, 0);
++	qcom_battmgr_apply_oem_data(battmgr);
+ 	mutex_unlock(&battmgr->lock);
+ 
+-        /* Try OEM read buffer and override with real fuel gauge data */
+-        if (!qcom_battmgr_oem_read_buffer(battmgr))
+-                qcom_battmgr_apply_oem_data(battmgr);
+-
++	/* Refresh 256B OEM fuel-gauge buffer asynchronously when stale (>2s) */
++	if (!battmgr->oem_read_buf_valid ||
++	    time_after(jiffies, battmgr->oem_last_update + msecs_to_jiffies(2000)))
++		schedule_work(&battmgr->oem_read_work);
+ 
+ 	return ret;
+ }
+@@ -2938,6 +2982,7 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
+          * pmic_glink_register_client().
+          */
+         qcom_battmgr_oplus_gauge_init(battmgr);
++        qcom_battmgr_oem_read_worker(&battmgr->oem_read_work);
+ 	schedule_delayed_work(&battmgr->otg_init_work, round_jiffies_relative(msecs_to_jiffies(3500)));
+ }
+ 
+@@ -3093,6 +3138,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = devm_work_autocancel(dev, &battmgr->oem_read_work,
++				   qcom_battmgr_oem_read_worker);
++	if (ret)
++		return ret;
++
+ 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
+ 						       qcom_battmgr_callback,
+ 						       qcom_battmgr_pdr_notify,
