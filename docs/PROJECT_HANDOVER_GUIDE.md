@@ -1,14 +1,10 @@
-> [!CAUTION]
-> **仅限测试与研究使用，不作正式环境使用（FOR TESTING & RESEARCH ONLY — NOT FOR PRODUCTION USE）**。  
-> 本文档及仓库内的路径、序列号、MAC 地址与内网 IP 均已做脱敏处理。
-
 # 一加 Ace Pro (PGP110 / ovaltine) 主线 Linux 移植完整工程指导手册
 
-> **文档版本**：v2.4 (P3.11 里程碑归档：P3.10 基线 + `qcom_battmgr` 墙充限流与 VoocPHY 熔断回落修复)  
+> **文档版本**：v2.5 (P3.12 里程碑归档：Wi-Fi 固定静态 IP + `qcom_battmgr` PD/PPS PDO 解析与阶梯 AICL 优化)  
 > **更新时间**：2026-11-23  
 > **目标系统**：Ubuntu Desktop / Phosh Mobile Linux (Linux 7.3.0-rc4 mainline)  
 > **目标机型**：一加 Ace Pro (OnePlus Ace Pro / PGP110 / 内部代号 `ovaltine` / 项目代号 `21841`)  
-> **当前实机运行版本**：**P3.11 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.11 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`，实机验证 `boot_id`: `1f42788e-acce-4ddf-8d20-27f8af57d469`；归档路径：[development/milestones/P3_11/](development/milestones/P3_11/)）
+> **当前实机运行版本**：**P3.12 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.12 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`、Wi-Fi 静态 IP `<STATIC_IP>/24`，实机验证 `boot_id`: `42bafa8f-6819-48a3-8993-b44712076973`；归档路径：[development/milestones/P3_12/](file://<WORKSPACE>/development/milestones/P3_12/)）
 
 ---
 
@@ -68,7 +64,7 @@ oplus,region-id = <0x01 0x02>;
 
 ### 2.2 全分区出厂镜像冷备份 (Golden Backup)
 已完成全量 136 个 UFS 分区的 SHA256 校验归档：
-* **备份存储路径**：`<BACKUP_DIR>/`
+* **备份存储路径**：`<WORKSPACE_ROOT>/pgp110_backup/`
 * **校验索引**：`pgp110_backup/SHA256SUMS.txt`
 * **关键保留镜像**：
   * `boot_b.img`, `vendor_boot_b.img`, `dtbo_b.img`, `vbmeta_b.img`, `vbmeta_system_b.img`
@@ -169,7 +165,7 @@ oplus,region-id = <0x01 0x02>;
 * 传统主线源码树：`src/xec-linux-7.3-rc4/` (Git 分支 `7.3-rc4`, 基线 commit `6d6be0ba1`)
 * 平台工具集：`tools/bin/`, `tools/platform-tools/` (包含 `mkbootimg`, `unpack_bootimg`, `dtc`)
 * P3.5 全量构建归档：`build_p3_5/imgs/`
-* Orchestrator 规范化开发与基线目录：`development/`（P3.7 基线：`TASK-20261118-110042`；P3.8 归档：`development/milestones/P3_8/`；**当前 P3.9 节点产物归档**：[development/milestones/P3_9/](development/milestones/P3_9/)）
+* Orchestrator 规范化开发与基线目录：`development/`（P3.7 基线：`TASK-20261118-110042`；P3.8 归档：`development/milestones/P3_8/`；**当前 P3.9 节点产物归档**：[development/milestones/P3_9/](file://<WORKSPACE>/development/milestones/P3_9/)）
 
 ### 5.2 核心补丁文件列表
 1. `arch/arm64/boot/dts/qcom/sm8475-oneplus-ovaltine.dts`：一加 Ace Pro 专用设备树主文件。
@@ -301,7 +297,7 @@ ssh root@172.16.42.1 "tar -xzf /tmp/p3_5_modules_fw.tar.gz -C /usr && depmod -a 
 自 2026-11-17 起，内核与系统演进全面纳入 **AI-Development-Orchestrator** 人工门禁工作流管理，严禁直接在主工作区或未经审批跳过门禁修改/刷写内核。
 
 ### 8.1 目录架构
-* **调度器源码目录**：`<HOME>/文档/macos/AI-Development-Orchestrator/`
+* **调度器源码目录**：`<WORKSPACE_ROOT>/AI-Development-Orchestrator/`
   * 核心程序：`app.py`（Tkinter 桌面审批控制台）、`coordinator.py`（命令行/门禁协调器）、`config/models.json`、角色配置 `profiles/{planner,executor,reviewer}.config.toml`、提示词 `prompts/`、模板 `templates/`、`install.sh`、`run.sh`。
 * **Ace Pro 规范化开发目录**：`<WORKSPACE>/development/`
   * `admission/xec-linux-7.3-rc4`：纯净基准仓库（Clean admission repo，base commit `6d6be0ba139e89d843e62f56cbd9f829775901d5`），仅作只读基线，**禁止作为执行修改目录**。
@@ -332,7 +328,7 @@ ssh root@172.16.42.1 "tar -xzf /tmp/p3_5_modules_fw.tar.gz -C /usr && depmod -a 
 * **LXC 容器与网络实测通过**：
   * 双容器并行（`acepro-p36-r2a`、`acepro-p36-r2b`）完成两轮启停生命周期与 `lxc-net` 重启恢复验证：
   * DHCP 正常分配 IPv4（`10.0.3.15/24`、`10.0.3.16/24`；首轮单容器 smoke 为 `10.0.3.152/24`），PID 与网络命名空间独立，`Seccomp=2`；
-  * 容器经 `10.0.3.1` 正常解析 `example.com` IPv4 DNS，同桥互 ping 成功，并经 Wi-Fi（`192.168.x.160`）完成 HTTP 外网访问与 SNAT 计数实证（后续 P3.6/P3.7 A/B 对照中经 USB `172.16.42.1` 完成每版 12 次独立 HTTP SNAT 验证）。
+  * 容器经 `10.0.3.1` 正常解析 `example.com` IPv4 DNS，同桥互 ping 成功，并经 Wi-Fi（`<GATEWAY>60`）完成 HTTP 外网访问与 SNAT 计数实证（后续 P3.6/P3.7 A/B 对照中经 USB `172.16.42.1` 完成每版 12 次独立 HTTP SNAT 验证）。
 * **6080 面板测点性质确认**（`THERMAL-20261118-01`）：
   * 设备内置 6080 面板（`lxc-webui.service`，`/opt/lxc-webui/lxc-webui`，接口 `GET /api/dashboard`）显示的 43–45°C（三轮采样八核范围 `43.4–45.1°C`）**确认为 CPU/SoC 温度**（`stats.cpu_cores[].temp_c`），而非电池（同期 `39.7°C`）或外壳表面温度。
 
@@ -365,14 +361,21 @@ ssh root@172.16.42.1 "tar -xzf /tmp/p3_5_modules_fw.tar.gz -C /usr && depmod -a 
 
 ## 10. P3.8 / P3.9 研发进度与里程碑交付
 
-P3.8 围绕 **R3（USB HS-only）** 与 **R1（显示 DSI PHY AHB `prepare` 生命周期）** 完成交付并归档于 [development/milestones/P3_8/](development/milestones/P3_8/)；随后 **P3.9 (`TASK-20261120-010302`)** 完成 **R2（GPU/GMU Runtime PM HFI 中断与内存序根治）**、撤销设备端保活规则并归档于 [development/milestones/P3_9/](development/milestones/P3_9/)。
+P3.8 围绕 **R3（USB HS-only）** 与 **R1（显示 DSI PHY AHB `prepare` 生命周期）** 完成交付并归档于 [development/milestones/P3_8/](file://<WORKSPACE>/development/milestones/P3_8/)；随后 **P3.9 (`TASK-20261120-010302`)** 完成 **R2（GPU/GMU Runtime PM HFI 中断与内存序根治）**、撤销设备端保活规则并归档于 [development/milestones/P3_9/](file://<WORKSPACE>/development/milestones/P3_9/)。
+
+### 10.0-B P3.12 Wi-Fi 静态 IP 固化与 `qcom_battmgr` PD/PPS 优化 (`TASK-20261123-231500`, `PASS`)
+* **Wi-Fi 静态 IP 固化 (`<STATIC_IP>/24`)**：通过 `nmcli` 将 `<WIFI_SSID>`（`<NM_UUID>`）设为 `manual` `<STATIC_IP>/24`（网关/DNS `<GATEWAY>`，不改随机 MAC；原配置备份于 `/root/90-NM-<NM_UUID>.yaml.bak`），跨重启验证 MAC 变化后 IP 仍稳定锁定 `<STATIC_IP>/24`。
+* **对照原厂 `oplus_battery_sm8450.c` / `oplus-chg-21841.dtsi` 实现与发现**：
+  * 新增 `PPS_OPCODE_READ_BUFFER (0x10004)` 成功解码适配器全部 PDO（`5V/3A`, `9V/3A`, `12V/3A`, `15V/3A`, `20V/7A`, `PPS 3.3-21V 6.35A`、`subtype=0, pps_type=1, fcc_lim_max=4500000`）；
+  * 处理 `0x58/0x5A/0x78/0x79` ADSP 通知消除 `unknown notification: 0x78`，新增 `adap_cfg_lock` 串行化与阶梯 AICL 消除 VBUS 塌陷；
+  * 实测 `BATT_OPLUS_SET_PDO(9000)` 返回 `0` 但当前 ADSP 固件在 `PD_PPS` 且无外部电荷泵驱动下维持 `5V/2.0A` 稳态供电（`4.68V / 1.997A`、`+630mA` 净充入，与 `oplus-chg-21841.dtsi` `qcom,pd_input_current_charger_ma = 2000` 一致），归档至 [development/milestones/P3_12/](file://<WORKSPACE>/development/milestones/P3_12/)。
 
 ### 10.0-A P3.11 墙充限流与 VoocPHY 熔断修复 (`TASK-20261123-220715`, `PASS`)
-* **修复内容 (`drivers/power/supply/qcom_battmgr.c`)**：映射 `adap_type=9 -> APPLE_BRICK_ID`、`PD_SDP(17) -> PD`，提取公共 `qcom_battmgr_oplus_apply_adap_limits()`，并增加 `vooc_commu_failures >= 2` 熔断回落标准 `5V/2.0A` 状态机，归档至 [development/milestones/P3_11/](development/milestones/P3_11/)。
+* **修复内容 (`drivers/power/supply/qcom_battmgr.c`)**：映射 `adap_type=9 -> APPLE_BRICK_ID`、`PD_SDP(17) -> PD`，提取公共 `qcom_battmgr_oplus_apply_adap_limits()`，并增加 `vooc_commu_failures >= 2` 熔断回落标准 `5V/2.0A` 状态机，归档至 [development/milestones/P3_11/](file://<WORKSPACE>/development/milestones/P3_11/)。
 * **实机 60s 墙充验收 (`boot_id`: `1f42788e-acce-4ddf-8d20-27f8af57d469`)**：识别 `wall brick adapter (type=9), setting 2.0A ICL/FCC` 并顺利协商 `PD_PPS` (`9V/3A`)，`usb.input_current_limit=2000000`，`bat.current_now=+666~+675mA`，零 `COMMU_TIME_OUT`，60 秒内电量 `16% -> 17%`。
 
 ### 10.0 P3.10 S2R (`deep` / `s2idle`) 与触控唤醒修复 (`TASK-20261123-000413`, `PASS`)
-* **根因与修复 (`drivers/input/touchscreen/synaptics_tcm.c`)**：`synaptics_tcm_resume()` 上电复位后未先执行 `identify_chip` / `get_fw_config`，且 `preserve_touch_report_config()` 未校验 `TCM_STATUS_OK (0x01)` 与排空异步 `REPORT_IDENTIFY`（28 字节），导致唤醒后覆盖开机时的 128 字节 `touch_config` 使触控失灵。修复后新增公共命令应答排空函数 `synaptics_tcm_read_cmd_resp()`、`identify_chip` 长度防护、`suspend()` 释放 `active_slots` 及 `resume()` 完整重初始化序列，构建并归档至 [development/milestones/P3_10/](development/milestones/P3_10/)。
+* **根因与修复 (`drivers/input/touchscreen/synaptics_tcm.c`)**：`synaptics_tcm_resume()` 上电复位后未先执行 `identify_chip` / `get_fw_config`，且 `preserve_touch_report_config()` 未校验 `TCM_STATUS_OK (0x01)` 与排空异步 `REPORT_IDENTIFY`（28 字节），导致唤醒后覆盖开机时的 128 字节 `touch_config` 使触控失灵。修复后新增公共命令应答排空函数 `synaptics_tcm_read_cmd_resp()`、`identify_chip` 长度防护、`suspend()` 释放 `active_slots` 及 `resume()` 完整重初始化序列，构建并归档至 [development/milestones/P3_10/](file://<WORKSPACE>/development/milestones/P3_10/)。
 * **实机 4 轮验收 (`boot_id`: `0d115116-2a2e-4642-be35-2f3d8299ba8b`)**：连续完成 3 轮 `deep` (`WIFI=enabled` / `disabled` / `enabled`) + 1 轮 `s2idle` (`WIFI=enabled`) `systemctl suspend` 休眠唤醒（`suspend_stats`: `success=4, fail=0`），单次电源键亮/熄屏、触控滑动解锁（`128 bytes`）、`wlp1s0` 重连、`es2gears_wayland` + GPU/GMU `auto` 挂起与声卡均正常。
 
 ### 10.1 P3.9-R2 已完成实机验收项 (`TASK-20261120-010302`, `PASS`)

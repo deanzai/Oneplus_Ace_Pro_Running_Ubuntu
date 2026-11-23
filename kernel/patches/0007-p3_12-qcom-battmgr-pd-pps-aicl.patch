@@ -1,0 +1,584 @@
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 002950646..018fca38a 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -190,9 +190,13 @@ enum oplus_power_supply_usb_type {
+ #define CHARGE_CTRL_END_THR_MAX		100
+ #define CHARGE_CTRL_DELTA_SOC		5
+ 
+-/* Oplus OEM read buffer opcode and layout */
++/* Oplus OEM / PPS read buffer opcodes and layout */
+ #define OEM_OPCODE_READ_BUFFER         0x10000
++#define PPS_OPCODE_READ_BUFFER         0x10004
+ #define OEM_READ_BUF_MAX               128
++#define PPS_PDO_MAX                    7
++#define AICL_POINT_VOL_9V_MV           7600
++#define AICL_POINT_VOL_5V_MV           4500
+ /* OEM buffer indices (from Oplus ADSP firmware) */
+ #define OEM_BUF_TEMP                   0
+ #define OEM_BUF_CURRENT                        1
+@@ -222,7 +226,11 @@ enum oplus_power_supply_usb_type {
+ #define NOTIF_VOOC_VBUS_ADC_ENABLE     0x52  /* BC_VOOC_VBUS_ADC_ENABLE */
+ #define BC_CID_NOTIF	       	       0x53
+ #define NOTIF_PD_SVOOC                 0x56  /* BC_PD_SVOOC */
++#define BC_APSD_DONE                   0x58
++#define BC_PD_SOFT_RESET               0x5A
+ #define NOTIF_VOOC_CHG_PUMP_0          0x62  /* Charge pump event */
++#define BC_BATTERY_RESET_START         0x78
++#define BC_PD_SOURCECAP_DONE           0x79
+ #define NOTIF_VOOC_CHG_PUMP_1          0x63  /* Charge pump MOS event */
+ 
+ /*
+@@ -457,7 +465,10 @@ struct qcom_battmgr_usb {
+ 	unsigned int current_limit;
+ 	unsigned int usb_type;
+ 	unsigned int adap_type;
+-        unsigned int voocphy_status_raw;
++	unsigned int adap_subtype;
++	unsigned int vbus_collapse;
++	unsigned int pps_type;
++	unsigned int voocphy_status_raw;
+ };
+ 
+ struct qcom_battmgr_wireless {
+@@ -499,11 +510,18 @@ struct qcom_battmgr {
+         bool oem_read_buf_supported;
+         bool oem_read_buf_tried;
+         u32 oem_read_buf[OEM_READ_BUF_MAX];
++        u32 pps_read_buf[OEM_READ_BUF_MAX];
++        bool pps_read_buf_valid;
++        u32 active_read_opcode;
+         struct completion oem_read_ack;
+         struct mutex oem_read_lock;
++        struct mutex adap_cfg_lock;
+ 
+         /* Oplus ADSP fuel gauge init tracking */
+         bool gauge_init_done;
++        unsigned int batt_chg_ctrl_lim_max;
++        bool pd_sourcecap_done;
++        bool pd_9v_attempted;
+ 
+         /* Periodic VoocPHY re-enable (matches stock 5s polling) */
+         struct delayed_work voocphy_recheck_work;
+@@ -1457,63 +1475,86 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
+ 	.get_property = qcom_battmgr_wls_get_property,
+ };
+ 
+-static int qcom_battmgr_oem_read_buffer(struct qcom_battmgr *battmgr)
++static int qcom_battmgr_read_buffer_opcode(struct qcom_battmgr *battmgr, u32 opcode)
+ {
+         struct qcom_battmgr_oem_read_req req = {
+                 .hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+                 .hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+-                .hdr.opcode = cpu_to_le32(OEM_OPCODE_READ_BUFFER),
++                .hdr.opcode = cpu_to_le32(opcode),
+                 .data_size = cpu_to_le32(sizeof(battmgr->oem_read_buf)),
+         };
+         unsigned long left;
+         int ret;
+ 
+-        /* Don't retry if we already know firmware doesn't support this */
+-        if (battmgr->oem_read_buf_tried && !battmgr->oem_read_buf_supported)
++        if (opcode == OEM_OPCODE_READ_BUFFER &&
++            battmgr->oem_read_buf_tried && !battmgr->oem_read_buf_supported)
+                 return -EOPNOTSUPP;
+ 
+         mutex_lock(&battmgr->oem_read_lock);
++        battmgr->active_read_opcode = opcode;
++        if (opcode == PPS_OPCODE_READ_BUFFER)
++                battmgr->pps_read_buf_valid = false;
+         reinit_completion(&battmgr->oem_read_ack);
+ 
+         ret = pmic_glink_send(battmgr->client, &req, sizeof(req));
+         if (ret < 0) {
++                battmgr->active_read_opcode = 0;
+                 mutex_unlock(&battmgr->oem_read_lock);
+-                battmgr->oem_read_buf_tried = true;
++                if (opcode == OEM_OPCODE_READ_BUFFER)
++                        battmgr->oem_read_buf_tried = true;
+                 return ret;
+         }
+ 
+         left = wait_for_completion_timeout(&battmgr->oem_read_ack, msecs_to_jiffies(500));
++        battmgr->active_read_opcode = 0;
+         mutex_unlock(&battmgr->oem_read_lock);
+ 
+-        battmgr->oem_read_buf_tried = true;
++        if (opcode == OEM_OPCODE_READ_BUFFER)
++                battmgr->oem_read_buf_tried = true;
+         if (!left) {
+-                dev_info(battmgr->dev, "oem read buffer timed out, firmware may not support it\n");
++                dev_info(battmgr->dev, "read buffer opcode %#x timed out\n", opcode);
+                 return -ETIMEDOUT;
+         }
+ 
+-        battmgr->oem_read_buf_supported = true;
+-        dev_dbg(battmgr->dev, "oem read buffer supported by firmware\n");
++        if (opcode == OEM_OPCODE_READ_BUFFER)
++                battmgr->oem_read_buf_supported = true;
+         return 0;
+ }
+ 
++static int qcom_battmgr_oem_read_buffer(struct qcom_battmgr *battmgr)
++{
++        return qcom_battmgr_read_buffer_opcode(battmgr, OEM_OPCODE_READ_BUFFER);
++}
++
+ static void qcom_battmgr_oem_read_response(struct qcom_battmgr *battmgr,
+-                                            const void *data, size_t len)
++                                            const void *data, size_t len,
++                                            u32 opcode)
+ {
+         const struct qcom_battmgr_oem_read_resp *resp = data;
++        u32 *dst;
+         u32 buf_len;
+ 
+         if (len > sizeof(*resp)) {
+-                dev_warn(battmgr->dev, "oem read: incorrect length %zu\n", len);
++                dev_warn(battmgr->dev, "read buf %#x: incorrect length %zu\n", opcode, len);
+                 return;
+         }
+ 
+         buf_len = le32_to_cpu(resp->data_size);
+         if (buf_len == 0 || buf_len > sizeof(battmgr->oem_read_buf)) {
+-                dev_warn(battmgr->dev, "oem read: invalid buffer length %u\n", buf_len);
++                dev_warn(battmgr->dev, "read buf %#x: invalid length %u\n", opcode, buf_len);
+                 return;
+         }
+ 
+-        memcpy(battmgr->oem_read_buf, resp->data_buffer, buf_len);
++        if (opcode == PPS_OPCODE_READ_BUFFER) {
++                dst = battmgr->pps_read_buf;
++                memcpy(dst, resp->data_buffer, buf_len);
++                battmgr->pps_read_buf_valid = true;
++                complete(&battmgr->oem_read_ack);
++                return;
++        }
++
++        dst = battmgr->oem_read_buf;
++        memcpy(dst, resp->data_buffer, buf_len);
+         battmgr->oem_read_buf_valid = true;
+ 
+         dev_dbg(battmgr->dev, "oem read: data_size=%u bytes (%u u32s)\n",
+@@ -1735,6 +1776,27 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
+ 		battmgr->otg_enabled = false;
+ 		power_supply_changed(battmgr->usb_psy);
+ 		break;
++	case BC_APSD_DONE:
++		dev_dbg(battmgr->dev, "oplus: APSD done\n");
++		mod_delayed_work(system_wq, &battmgr->voocphy_recheck_work,
++				 msecs_to_jiffies(200));
++		break;
++	case BC_PD_SOFT_RESET:
++		dev_info(battmgr->dev, "oplus: PD soft/hard reset\n");
++		battmgr->pd_9v_attempted = false;
++		break;
++	case BC_BATTERY_RESET_START:
++		dev_dbg(battmgr->dev, "oplus: battery reset start (0x78)\n");
++		break;
++	case BC_PD_SOURCECAP_DONE:
++		dev_info(battmgr->dev, "oplus: PD SourceCap done (0x79)\n");
++		battmgr->pd_sourcecap_done = true;
++		if (!battmgr->pd_9v_attempted) {
++			battmgr->vooc_limits_set = false;
++			mod_delayed_work(system_wq, &battmgr->voocphy_recheck_work,
++					 msecs_to_jiffies(200));
++		}
++		break;
+ 	default:
+ 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
+ 		break;
+@@ -2009,6 +2071,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+ 		case BATT_CHG_CTRL_END_THR:
+ 			battmgr->info.charge_ctrl_end = le32_to_cpu(resp->intval.value);
+ 			break;
++		case BATT_CHG_CTRL_LIM_MAX:
++			battmgr->batt_chg_ctrl_lim_max = le32_to_cpu(resp->intval.value);
++			break;
+ 		default:
+ 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
+ 			break;
+@@ -2065,6 +2130,15 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
+                 case USB_OPLUS_VOOCPHY_STATUS:
+                         battmgr->usb.voocphy_status_raw = le32_to_cpu(resp->intval.value);
+                         break;
++		case USB_ADAP_SUBTYPE:
++			battmgr->usb.adap_subtype = le32_to_cpu(resp->intval.value);
++			break;
++		case USB_VBUS_COLLAPSE_STATUS:
++			battmgr->usb.vbus_collapse = le32_to_cpu(resp->intval.value);
++			break;
++		case USB_GET_PPS_TYPE:
++			battmgr->usb.pps_type = le32_to_cpu(resp->intval.value);
++			break;
+ 		default:
+ 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
+ 			break;
+@@ -2134,8 +2208,9 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
+ 
+ 	if (opcode == BATTMGR_NOTIFICATION)
+ 		qcom_battmgr_notification(battmgr, data, len);
+-	else if (opcode == OEM_OPCODE_READ_BUFFER)
+-                qcom_battmgr_oem_read_response(battmgr, data, len);
++	else if (opcode == OEM_OPCODE_READ_BUFFER ||
++		 opcode == PPS_OPCODE_READ_BUFFER)
++		qcom_battmgr_oem_read_response(battmgr, data, len, opcode);
+ 	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+ 		 battmgr->variant == QCOM_BATTMGR_X1E80100)
+ 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
+@@ -2257,6 +2332,133 @@ static void qcom_battmgr_voocphy_status_worker(struct work_struct *work)
+  * This matches the stock driver's crash recovery sequence:
+  *   oplus_ap_init_adsp_gague() → oplus_adsp_voocphy_enable(true)
+  */
++static void qcom_battmgr_oplus_probe_pd_caps(struct qcom_battmgr *battmgr,
++					     int *max_9v_curr_ma,
++					     int *max_5v_curr_ma)
++{
++	int ret, i;
++
++	*max_9v_curr_ma = 0;
++	*max_5v_curr_ma = 0;
++
++	mutex_lock(&battmgr->lock);
++	qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++				      USB_ADAP_SUBTYPE, 0);
++	qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++				      USB_GET_PPS_TYPE, 0);
++	qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
++				      BATT_CHG_CTRL_LIM_MAX, 0);
++	mutex_unlock(&battmgr->lock);
++
++	ret = qcom_battmgr_read_buffer_opcode(battmgr, PPS_OPCODE_READ_BUFFER);
++	if (!ret && battmgr->pps_read_buf_valid) {
++		for (i = 0; i < PPS_PDO_MAX; i++) {
++			u32 pdo = battmgr->pps_read_buf[i + 2];
++			u32 type = (pdo >> 30) & 0x3;
++
++			if (!pdo)
++				continue;
++
++			if (type == 0) {
++				int vol_mv = ((pdo >> 10) & 0x3ff) * 50;
++				int curr_ma = (pdo & 0x3ff) * 10;
++
++				dev_info(battmgr->dev,
++					 "oplus pd pdo[%d]: FIXED %dmV %dmA (raw=0x%08x)\n",
++					 i, vol_mv, curr_ma, pdo);
++				if (vol_mv >= 8500 && vol_mv <= 9500 &&
++				    curr_ma > *max_9v_curr_ma)
++					*max_9v_curr_ma = curr_ma;
++				if (vol_mv >= 4500 && vol_mv <= 5500 &&
++				    curr_ma > *max_5v_curr_ma)
++					*max_5v_curr_ma = curr_ma;
++			} else if (type == 3) {
++				int min_mv = ((pdo >> 8) & 0xff) * 100;
++				int max_mv = ((pdo >> 17) & 0xff) * 100;
++				int curr_ma = (pdo & 0x7f) * 50;
++
++				dev_info(battmgr->dev,
++					 "oplus pd pdo[%d]: PPS %d-%dmV %dmA (raw=0x%08x)\n",
++					 i, min_mv, max_mv, curr_ma, pdo);
++				if (max_mv >= 9000 && curr_ma > *max_9v_curr_ma)
++					*max_9v_curr_ma = curr_ma;
++			}
++		}
++	}
++
++	dev_info(battmgr->dev,
++		 "oplus pd caps: subtype=%u pps_type=%u fcc_lim_max=%u max_5v=%dmA max_9v=%dmA\n",
++		 battmgr->usb.adap_subtype, battmgr->usb.pps_type,
++		 battmgr->batt_chg_ctrl_lim_max, *max_5v_curr_ma, *max_9v_curr_ma);
++}
++
++static void qcom_battmgr_oplus_set_icl_aicl(struct qcom_battmgr *battmgr,
++					    int target_icl_ma,
++					    int aicl_point_mv)
++{
++	static const int usb_icl_ma[] = {
++		100, 500, 900, 1200, 1350, 1500, 1750, 2000, 3000,
++	};
++	int i, last_good_idx = 1;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(usb_icl_ma); i++) {
++		if (i > 0 && usb_icl_ma[i] > target_icl_ma)
++			break;
++
++		mutex_lock(&battmgr->lock);
++		ret = qcom_battmgr_request_property(battmgr,
++						    BATTMGR_USB_PROPERTY_SET,
++						    USB_INPUT_CURR_LIMIT,
++						    usb_icl_ma[i] * 1000);
++		mutex_unlock(&battmgr->lock);
++		if (ret) {
++			dev_warn(battmgr->dev,
++				 "oplus aicl: set ICL %dmA failed: %d\n",
++				 usb_icl_ma[i], ret);
++			break;
++		}
++
++		if (usb_icl_ma[i] < 500) {
++			usleep_range(25000, 26000);
++			if (target_icl_ma < 500)
++				break;
++			continue;
++		}
++
++		msleep(usb_icl_ma[i] == 1350 ? 130 : 60);
++
++		mutex_lock(&battmgr->lock);
++		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					      USB_VBUS_COLLAPSE_STATUS, 0);
++		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					      USB_VOLT_NOW, 0);
++		mutex_unlock(&battmgr->lock);
++
++		if (battmgr->usb.vbus_collapse ||
++		    (battmgr->usb.voltage_now > 0 &&
++		     battmgr->usb.voltage_now < (unsigned int)aicl_point_mv * 1000)) {
++			int back_ma = usb_icl_ma[last_good_idx];
++
++			dev_info(battmgr->dev,
++				 "oplus aicl: VBUS sag at %dmA (vbus=%uuV collapse=%u < %dmV), backing down to %dmA\n",
++				 usb_icl_ma[i], battmgr->usb.voltage_now,
++				 battmgr->usb.vbus_collapse, aicl_point_mv, back_ma);
++			mutex_lock(&battmgr->lock);
++			qcom_battmgr_request_property(battmgr,
++						      BATTMGR_USB_PROPERTY_SET,
++						      USB_INPUT_CURR_LIMIT,
++						      back_ma * 1000);
++			mutex_unlock(&battmgr->lock);
++			return;
++		}
++		last_good_idx = i;
++	}
++
++	dev_info(battmgr->dev, "oplus aicl: settled ICL at %dmA (vbus=%uuV)\n",
++		 usb_icl_ma[last_good_idx], battmgr->usb.voltage_now);
++}
++
+ static void qcom_battmgr_oplus_apply_adap_limits(struct qcom_battmgr *battmgr,
+ 						 int adap_type,
+ 						 bool fallback_non_vooc)
+@@ -2265,18 +2467,24 @@ static void qcom_battmgr_oplus_apply_adap_limits(struct qcom_battmgr *battmgr,
+ 	int pdo_mv = 0;		/* 0 = don't change PDO */
+ 	int icl_ua = 500000;	/* default SDP 500mA */
+ 	int fcc_ua = 500000;	/* default SDP 500mA */
++	int aicl_point_mv = AICL_POINT_VOL_5V_MV;
+ 	bool skip_fcc = false;
++	bool use_stepped_aicl = false;
++	bool is_pd = false;
++
++	mutex_lock(&battmgr->adap_cfg_lock);
+ 
+ 	switch (adap_type) {
+ 	case POWER_SUPPLY_USB_TYPE_PD:
+ 	case POWER_SUPPLY_USB_TYPE_PD_DRP:
+ 	case POWER_SUPPLY_USB_TYPE_PD_PPS:
+ 	case POWER_SUPPLY_USB_TYPE_PD_SDP:
++		is_pd = true;
+ 		pdo_mv = 9000;
+-		icl_ua = 3000000;
+-		fcc_ua = 3000000;
++		icl_ua = 2000000;
++		fcc_ua = 2000000;
+ 		dev_info(battmgr->dev,
+-			 "oplus: PD/PPS adapter detected (type=%d), requesting 9V/3A\n",
++			 "oplus: PD/PPS adapter detected (type=%d), negotiating 9V PDO\n",
+ 			 adap_type);
+ 		break;
+ 	case POWER_SUPPLY_USB_TYPE_DCP:
+@@ -2329,30 +2537,75 @@ static void qcom_battmgr_oplus_apply_adap_limits(struct qcom_battmgr *battmgr,
+ 		break;
+ 	}
+ 
+-	/* Request higher voltage PDO if PD-capable */
+-	if (pdo_mv > 0) {
++	if (is_pd) {
++		int max_9v_curr_ma = 0, max_5v_curr_ma = 0;
++		int poll;
++
++		mutex_lock(&battmgr->lock);
++		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					      USB_VOLT_NOW, 0);
++		qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++					      USB_VOLT_MAX, 0);
++		mutex_unlock(&battmgr->lock);
++
++		dev_info(battmgr->dev,
++			 "oplus pd pre-pdo: vbus=%uuV vmax=%uuV\n",
++			 battmgr->usb.voltage_now, battmgr->usb.voltage_max);
++		if (battmgr->usb.voltage_now < 3500000) {
++			dev_info(battmgr->dev,
++				 "oplus pd: VBUS < 3.5V (%uuV), deferring PDO switch\n",
++				 battmgr->usb.voltage_now);
++			goto out_unlock;
++		}
++
++		qcom_battmgr_oplus_probe_pd_caps(battmgr, &max_9v_curr_ma,
++						 &max_5v_curr_ma);
++
++		/* 5V->9V switch: do not drop ICL to 500mA before BATT_SET_PDO */
+ 		mutex_lock(&battmgr->lock);
+ 		ret = qcom_battmgr_request_property(battmgr,
+ 						    BATTMGR_BAT_PROPERTY_SET,
+ 						    BATT_OPLUS_SET_PDO, pdo_mv);
+ 		mutex_unlock(&battmgr->lock);
+-		if (ret)
+-			dev_warn(battmgr->dev,
+-				 "failed to set PDO %dmV: %d\n", pdo_mv, ret);
+-		else
+-			msleep(300); /* PD re-negotiation delay */
+-	}
++		battmgr->pd_9v_attempted = true;
++		dev_info(battmgr->dev, "oplus pd: BATT_OPLUS_SET_PDO(%dmV) pdo_ret=%d\n",
++			 pdo_mv, ret);
++
++		msleep(300);
++		for (poll = 0; poll < 5; poll++) {
++			mutex_lock(&battmgr->lock);
++			qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++						      USB_VOLT_NOW, 0);
++			qcom_battmgr_request_property(battmgr, BATTMGR_USB_PROPERTY_GET,
++						      USB_VOLT_MAX, 0);
++			mutex_unlock(&battmgr->lock);
++
++			if (battmgr->usb.voltage_now >= AICL_POINT_VOL_9V_MV * 1000 ||
++			    battmgr->usb.voltage_max >= 8000000)
++				break;
++			msleep(200);
++		}
+ 
+-	/* Set input current limit (after PDO switch) */
+-	dev_info(battmgr->dev, "oplus: setting ICL to %d.%03dA\n",
+-		 icl_ua / 1000000, (icl_ua % 1000000) / 1000);
+-	mutex_lock(&battmgr->lock);
+-	ret = qcom_battmgr_request_property(battmgr,
+-					    BATTMGR_USB_PROPERTY_SET,
+-					    USB_INPUT_CURR_LIMIT, icl_ua);
+-	mutex_unlock(&battmgr->lock);
+-	if (ret)
+-		dev_warn(battmgr->dev, "failed to set ICL: %d\n", ret);
++		if (battmgr->usb.voltage_now >= AICL_POINT_VOL_9V_MV * 1000 ||
++		    battmgr->usb.voltage_max >= 8000000) {
++			int cap_ma = max_9v_curr_ma ? clamp(max_9v_curr_ma, 500, 3000) : 2000;
++
++			icl_ua = cap_ma * 1000;
++			fcc_ua = 3000000;
++			aicl_point_mv = AICL_POINT_VOL_9V_MV;
++		} else {
++			int cap_ma = max_5v_curr_ma ? clamp(max_5v_curr_ma, 500, 2000) : 2000;
++
++			icl_ua = cap_ma * 1000;
++			fcc_ua = 2000000;
++			aicl_point_mv = AICL_POINT_VOL_5V_MV;
++		}
++		use_stepped_aicl = true;
++		dev_info(battmgr->dev,
++			 "oplus pd post-pdo: vbus=%uuV vmax=%uuV target_icl=%dmA aicl_pt=%dmV\n",
++			 battmgr->usb.voltage_now, battmgr->usb.voltage_max,
++			 icl_ua / 1000, aicl_point_mv);
++	}
+ 
+ 	/* Enable charging */
+ 	mutex_lock(&battmgr->lock);
+@@ -2367,11 +2620,30 @@ static void qcom_battmgr_oplus_apply_adap_limits(struct qcom_battmgr *battmgr,
+ 	if (ret)
+ 		dev_warn(battmgr->dev, "failed to enable charging: %d\n", ret);
+ 
++	/* Set input current limit (stepped AICL for PD, direct write otherwise) */
++	if (use_stepped_aicl) {
++		qcom_battmgr_oplus_set_icl_aicl(battmgr, icl_ua / 1000,
++						aicl_point_mv);
++	} else {
++		dev_info(battmgr->dev, "oplus: setting ICL to %d.%03dA\n",
++			 icl_ua / 1000000, (icl_ua % 1000000) / 1000);
++		mutex_lock(&battmgr->lock);
++		ret = qcom_battmgr_request_property(battmgr,
++						    BATTMGR_USB_PROPERTY_SET,
++						    USB_INPUT_CURR_LIMIT, icl_ua);
++		mutex_unlock(&battmgr->lock);
++		if (ret)
++			dev_warn(battmgr->dev, "failed to set ICL: %d\n", ret);
++	}
++
+ 	/*
+ 	 * Set fast charge current unless in active DCP/VOOC mode, where
+ 	 * writing BATT_CHG_CTRL_LIM causes ADSP error 514.
+ 	 */
+ 	if (!skip_fcc) {
++		if (battmgr->batt_chg_ctrl_lim_max > 0 &&
++		    fcc_ua > (int)battmgr->batt_chg_ctrl_lim_max)
++			fcc_ua = battmgr->batt_chg_ctrl_lim_max;
+ 		dev_info(battmgr->dev, "oplus: setting FCC to %d.%03dA\n",
+ 			 fcc_ua / 1000000, (fcc_ua % 1000000) / 1000);
+ 		mutex_lock(&battmgr->lock);
+@@ -2388,6 +2660,9 @@ static void qcom_battmgr_oplus_apply_adap_limits(struct qcom_battmgr *battmgr,
+ 
+ 	battmgr->last_configured_adap_type = adap_type;
+ 	battmgr->vooc_limits_set = true;
++
++out_unlock:
++	mutex_unlock(&battmgr->adap_cfg_lock);
+ }
+ 
+ static void qcom_battmgr_oplus_gauge_init(struct qcom_battmgr *battmgr)
+@@ -2458,27 +2733,29 @@ static void qcom_battmgr_oplus_gauge_init(struct qcom_battmgr *battmgr)
+          * hardcoding values that only work for one charger type.
+          */
+         {
+-                int adap_type;
+-
+-                /* Query the adapter type from the ADSP */
++                /* Query USB online, VBUS, and adapter type from the ADSP */
+                 mutex_lock(&battmgr->lock);
++                qcom_battmgr_request_property(battmgr,
++                                BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
++                qcom_battmgr_request_property(battmgr,
++                                BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, 0);
+                 ret = qcom_battmgr_request_property(battmgr,
+                                 BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, 0);
+                 mutex_unlock(&battmgr->lock);
+ 
+-                adap_type = battmgr->usb.adap_type;
+-                if (ret) {
+-                        dev_warn(battmgr->dev,
+-                                 "failed to query adapter type: %d, assuming PD\n", ret);
+-                        adap_type = POWER_SUPPLY_USB_TYPE_PD;
++                if (ret || !battmgr->usb.online ||
++                    battmgr->usb.voltage_now < 3500000) {
++                        dev_info(battmgr->dev,
++                                 "oplus gauge init: deferring adap limits (ret=%d online=%d vbus=%uuV)\n",
++                                 ret, battmgr->usb.online, battmgr->usb.voltage_now);
++                } else {
++                        qcom_battmgr_oplus_apply_adap_limits(battmgr,
++                                battmgr->usb.adap_type,
++                                battmgr->vooc_fallback_active);
+                 }
+-
+-                qcom_battmgr_oplus_apply_adap_limits(battmgr, adap_type,
+-                                                     battmgr->vooc_fallback_active);
+         }
+ 
+         battmgr->gauge_init_done = true;
+-        battmgr->vooc_limits_set = true;
+         dev_info(battmgr->dev, "oplus gauge init sequence complete\n");
+ 
+         /* Start periodic VoocPHY re-enable check (every 5s, like stock) */
+@@ -2559,6 +2836,8 @@ static void qcom_battmgr_voocphy_recheck(struct work_struct *work)
+                         battmgr->last_configured_adap_type = -1;
+                         battmgr->vooc_commu_failures = 0;
+                         battmgr->vooc_fallback_active = false;
++                        battmgr->pd_sourcecap_done = false;
++                        battmgr->pd_9v_attempted = false;
+                 }
+                 goto reschedule;
+         }
+@@ -2730,6 +3009,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 	mutex_init(&battmgr->lock);
+ 	init_completion(&battmgr->ack);
+ 	mutex_init(&battmgr->oem_read_lock);
++	mutex_init(&battmgr->adap_cfg_lock);
+         init_completion(&battmgr->oem_read_ack);
+ 
+ 	oplus_otg_boost_en_gpio_init(battmgr);
