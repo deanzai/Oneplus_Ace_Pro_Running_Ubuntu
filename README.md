@@ -2,7 +2,7 @@
 
 > [!CAUTION]
 > **⚠️ 仅限测试与研究使用，禁止用于正式生产环境（FOR TESTING & RESEARCH ONLY — NOT FOR PRODUCTION USE）**  
-> 本仓库整理自一加 Ace Pro (SM8475 / `ovaltine`) 主线 Linux `7.3.0-rc4` 移植实验（P3.14 基线），包含内核配置、设备树、增量补丁、用户态 systemd/udev/显示脚本及工程文档。刷写内核与模块存在变砖风险，操作前请务必保留原厂分区与 Slot `_b` 备份。
+> 本仓库整理自一加 Ace Pro (SM8475 / `ovaltine`) 主线 Linux `7.3.0-rc4` 移植实验（P3.15 基线），包含内核配置、设备树、增量补丁、用户态 systemd/udev/显示脚本及工程文档。刷写内核与模块存在变砖风险，操作前请务必保留原厂分区与 Slot `_b` 备份。
 
 ---
 
@@ -41,16 +41,18 @@
 ├── README.md
 ├── .gitignore
 ├── docs/
-│   ├── PROJECT_HANDOVER_GUIDE.md   # 脱敏版工程指导手册 (v2.7)
-│   └── MILESTONES_SUMMARY.md       # P3.8–P3.14 里程碑与验收摘要
+│   ├── PROJECT_HANDOVER_GUIDE.md   # 脱敏版工程指导手册 (v2.8)
+│   └── MILESTONES_SUMMARY.md       # P3.8–P3.15 里程碑与验收摘要
 ├── kernel/
-│   ├── configs/ovaltine_p3_14.config
+│   ├── configs/ovaltine_p3_15.config
 │   ├── dts/{sm8475-oneplus-ovaltine.dts,sm8475-ovaltine.dtso}
 │   ├── drivers/panel-boe-rm692e5.c
-│   └── patches/                    # 按 0001 -> 0009 顺序应用到 Linux 7.3-rc4 (6d6be0ba1)
+│   └── patches/                    # 按 0001 -> 0010 顺序应用到 Linux 7.3-rc4 (6d6be0ba1)
 └── rootfs/
     ├── etc/{phosh/phoc.ini,systemd/system/*.service,udev/rules.d/90-acepro-input.rules}
-    └── usr/local/{bin/acepro-display-sync.py,sbin/*.sh,sbin/acepro-idle-suspend.py}
+    └── usr/
+        ├── lib/systemd/system-sleep/acepro-wowlan
+        └── local/{bin/acepro-display-sync.py,sbin/*.sh,sbin/acepro-idle-suspend.py}
 ```
 
 ## 5. 内核打补丁与构建指引
@@ -64,7 +66,7 @@
    ```bash
    for p in kernel/patches/000*.patch; do git -C <LINUX_SRC> apply "$p"; done
    ```
-3. 使用 `kernel/configs/ovaltine_p3_14.config` 作为 `.config`，设置 `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=` 编译内核镜像、`dtbs` 与 `modules`。
+3. 使用 `kernel/configs/ovaltine_p3_15.config` 作为 `.config`，设置 `ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION=` 编译内核镜像、`dtbs` 与 `modules`。
 
 > [!WARNING]
 > **双槽位安全红线**：本移植仅在 **Slot `_a`**（`boot_a` / `vendor_boot_a` / `dtbo_a`）调试，**严禁刷写或修改 Slot `_b`**（保留出厂系统作为急救回退）。

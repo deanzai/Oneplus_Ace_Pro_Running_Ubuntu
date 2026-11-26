@@ -1,4 +1,4 @@
-# 里程碑交付摘要（P3.8 / P3.9 / P3.10 / P3.11 / P3.12 / P3.13 / P3.14）
+# 里程碑交付摘要（P3.8 / P3.9 / P3.10 / P3.11 / P3.12 / P3.13 / P3.14 / P3.15）
 
 > [!CAUTION]
 > **仅限测试与研究使用，不作正式环境使用（FOR TESTING & RESEARCH ONLY — NOT FOR PRODUCTION USE）**。
@@ -14,6 +14,7 @@
 | **P3.12** | Wi-Fi 固定静态 IP (`<STATIC_IP>/24`) + `qcom_battmgr` `0x10004` PDO 解码、`0x58/0x5A/0x78/0x79` 通知、阶梯 AICL 消除塌陷 | `0007-p3_12-qcom-battmgr-pd-pps-aicl.patch`<br>`qcom_battmgr.ko` | `dbc0114d058e443c2c499899f120ac4ba379ec5190eb4e18f75e2935ed259599`<br>`9dc1b4cb12682d73359364bb6662bd8189438a740116c220f212bd941929ab1c` |
 | **P3.13** | 未插电黑屏 180s 自动 `deep` 休眠 (`acepro-idle-suspend.service`) + `qcom_battmgr` `mAh`/`uAh` 满充容量导出修复（消除 `upowerd` `nan`） | `0008-p3_13-qcom-battmgr-unit-mah.patch`<br>`qcom_battmgr.ko` | `8fc2d72a39fb3925d186aa33ed4103705e407eac01d1080e3baad7c35cc595e9` (`qcom_battmgr.ko`) |
 | **P3.14** | `qcom_battmgr` 256B OEM 电量计缓冲异步刷新与缓存直读（消除 450ms sysfs 阻塞，读取降至 `0.03~33ms`，恢复 `lxc-webui` 功率采集） | `0009-p3_14-qcom-battmgr-async-oem-cache.patch`<br>`qcom_battmgr.ko` | `126d536bbd324bd5114ca220c3eede4041ea939d74d354570d11066d33e211d4` (`qcom_battmgr.ko`) |
+| **P3.15** | WCN6855 `s2idle` Connected Standby 保活与来包自动唤醒（`d0_wow=N, keep_d0=N` 走 D3hot+MHI M3 经 Root Port `PCIe PME` 唤醒、`pcie-qcom` 保持最低 OPP、`wow` NACK `-EBUSY` 回滚防断链、动态 `wiphy` WoWLAN 钩子） | `0010-p3_15-ath11k-wowlan-pcie-pme-s2idle.patch`<br>`Image.gz` / `ath11k.ko` / `ath11k_pci.ko` / `qrtr-mhi.ko`<br>`acepro-wowlan` / `acepro-idle-suspend.py` | `1f37d83044ceed92869ef5f99c68b49fc2f99c15f193cc680c42daf6bc282e91455` (`Image.gz`)<br>`4a6d12e5b538982c3990ab242f55bc80185fc1512fc6dfc12b95176c6788b62a` (`ath11k.ko`)<br>`f08dc2b65f1543de14dae78c28c683a75dfef20ef85444632d6293300ae42035` (`ath11k_pci.ko`)<br>`9de8a0af84206f2f78b3ca106a0e0168f5f6a7f923c121f8d88265e2497cb78d` (`qrtr-mhi.ko`) |
 
 ## 2. P3.10 S2R 4 轮实机验收矩阵 (`PASS`)
 

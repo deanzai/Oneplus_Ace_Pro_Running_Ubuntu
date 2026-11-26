@@ -1,0 +1,957 @@
+diff --git a/drivers/irqchip/irq-gic-its-msi-parent.c b/drivers/irqchip/irq-gic-its-msi-parent.c
+index b2b9d2068..c9ce91311 100644
+--- a/drivers/irqchip/irq-gic-its-msi-parent.c
++++ b/drivers/irqchip/irq-gic-its-msi-parent.c
+@@ -290,6 +290,8 @@ static bool its_init_dev_msi_info(struct device *dev, struct irq_domain *domain,
+ 		return false;
+ 	}
+ 
++	info->chip->flags |= IRQCHIP_SKIP_SET_WAKE;
++
+ 	return true;
+ }
+ 
+@@ -316,6 +318,8 @@ static bool its_v5_init_dev_msi_info(struct device *dev, struct irq_domain *doma
+ 		return false;
+ 	}
+ 
++	info->chip->flags |= IRQCHIP_SKIP_SET_WAKE;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/irqchip/irq-gic-v3-its.c b/drivers/irqchip/irq-gic-v3-its.c
+index e9807af23..8307b7269 100644
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@ -2075,6 +2075,7 @@ static struct irq_chip its_irq_chip = {
+ 	.irq_set_irqchip_state	= its_irq_set_irqchip_state,
+ 	.irq_retrigger		= its_irq_retrigger,
+ 	.irq_set_vcpu_affinity	= its_irq_set_vcpu_affinity,
++	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index a0d725923..6783a78ed 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -19,6 +19,8 @@
+ #include <linux/suspend.h>
+ #include <linux/of.h>
+ 
++struct gpio_desc;
++
+ #include "qmi.h"
+ #include "htc.h"
+ #include "wmi.h"
+@@ -952,6 +954,17 @@ struct ath11k_base {
+ 
+ 	struct {
+ 		struct completion wakeup_completed;
++		int wake_irq;
++		int pewake_irq;
++		struct gpio_desc *pewake_gpio;
++		unsigned long ce_wake_armed;
++		unsigned long ce_wake_masked;
++		unsigned long ce_wake_irq_wake_mask;
++		bool wake_irq_enabled;
++		bool wake_irq_wake_enabled;
++		bool pewake_irq_enabled;
++		bool pewake_irq_wake_enabled;
++		bool d0_wow;
+ 	} wow;
+ 
+ 	struct ath11k_ce ce;
+diff --git a/drivers/net/wireless/ath/ath11k/htc.c b/drivers/net/wireless/ath/ath11k/htc.c
+index 5f9ee5e63..03275d23d 100644
+--- a/drivers/net/wireless/ath/ath11k/htc.c
++++ b/drivers/net/wireless/ath/ath11k/htc.c
+@@ -5,6 +5,7 @@
+  */
+ #include <linux/skbuff.h>
+ #include <linux/ctype.h>
++#include <linux/device.h>
+ 
+ #include "debug.h"
+ #include "hif.h"
+@@ -280,6 +281,7 @@ void ath11k_htc_tx_completion_handler(struct ath11k_base *ab,
+ static void ath11k_htc_wakeup_from_suspend(struct ath11k_base *ab)
+ {
+ 	ath11k_dbg(ab, ATH11K_DBG_BOOT, "wakeup from suspend is received\n");
++	pm_wakeup_dev_event(ab->dev, 0, true);
+ }
+ 
+ void ath11k_htc_rx_completion_handler(struct ath11k_base *ab,
+diff --git a/drivers/net/wireless/ath/ath11k/mhi.c b/drivers/net/wireless/ath/ath11k/mhi.c
+index a6c9ff112..91bc9abff 100644
+--- a/drivers/net/wireless/ath/ath11k/mhi.c
++++ b/drivers/net/wireless/ath/ath11k/mhi.c
+@@ -10,6 +10,8 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/ioport.h>
++#include <linux/device.h>
++#include <linux/suspend.h>
+ 
+ #include "core.h"
+ #include "debug.h"
+@@ -288,6 +290,12 @@ static void ath11k_mhi_op_status_cb(struct mhi_controller *mhi_cntrl,
+ 		spin_unlock_bh(&ab->base_lock);
+ 
+ 		break;
++	case MHI_CB_LPM_EXIT:
++	case MHI_CB_PENDING_DATA:
++	case MHI_CB_BW_REQ:
++		if (pm_suspend_target_state != PM_SUSPEND_ON)
++			pm_wakeup_dev_event(ab->dev, 0, true);
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/drivers/net/wireless/ath/ath11k/pci.c b/drivers/net/wireless/ath/ath11k/pci.c
+index a163168f3..532437460 100644
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -5,9 +5,13 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/msi.h>
+ #include <linux/pci.h>
+ #include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/device.h>
++#include <linux/suspend.h>
+ #include <linux/time.h>
+ #include <linux/vmalloc.h>
+ 
+@@ -20,6 +24,51 @@
+ #include "qmi.h"
+ 
+ #define ATH11K_PCI_BAR_NUM		0
++
++static bool ath11k_pci_d0_wow;
++module_param_named(d0_wow, ath11k_pci_d0_wow, bool, 0644);
++MODULE_PARM_DESC(d0_wow, "Enable PCI D0-WoW HTC wakeup for s2idle");
++
++static bool ath11k_pci_keep_d0;
++module_param_named(keep_d0, ath11k_pci_keep_d0, bool, 0644);
++MODULE_PARM_DESC(keep_d0, "Keep PCI endpoint in D0 with PME enabled during WoW suspend");
++
++static irqreturn_t ath11k_pci_pewake_irq_handler(int irq, void *arg)
++{
++	struct ath11k_base *ab = arg;
++
++	if (READ_ONCE(ab->wow.wake_irq_enabled)) {
++		ath11k_info(ab, "pewake irq %d triggered system wakeup\n", irq);
++		pm_wakeup_dev_event(ab->dev, 0, true);
++	} else {
++		ath11k_dbg(ab, ATH11K_DBG_PCI, "pewake irq %d ignored while awake\n", irq);
++	}
++	return IRQ_HANDLED;
++}
++
++static void ath11k_pci_free_wakeup_resources(struct ath11k_pci *ab_pci)
++{
++	struct ath11k_base *ab = ab_pci->ab;
++
++	if (ab->wow.wake_irq_enabled)
++		ath11k_pcic_wow_wake_irq_disable(ab);
++
++	if (ab->wow.pewake_irq > 0) {
++		free_irq(ab->wow.pewake_irq, ab);
++		ab->wow.pewake_irq = 0;
++	}
++
++	if (ab->wow.pewake_gpio) {
++		gpiod_put(ab->wow.pewake_gpio);
++		ab->wow.pewake_gpio = NULL;
++	}
++
++	if (ab_pci->rsc_dev) {
++		device_init_wakeup(ab_pci->rsc_dev, false);
++		put_device(ab_pci->rsc_dev);
++		ab_pci->rsc_dev = NULL;
++	}
++}
+ #define ATH11K_PCI_DMA_MASK		36
+ #define ATH11K_PCI_COHERENT_DMA_MASK	32
+ 
+@@ -1137,6 +1186,47 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 		goto err_free_irq;
+ 	}
+ 
++	ab->wow.d0_wow = ath11k_pci_d0_wow;
++	device_set_wakeup_enable(&pdev->dev, true);
++	if (pdev->bus && pdev->bus->self &&
++	    device_can_wakeup(&pdev->bus->self->dev))
++		device_set_wakeup_enable(&pdev->bus->self->dev, true);
++	ab_pci->rsc_dev = bus_find_device_by_name(&platform_bus_type, NULL,
++						  "17a00000.rsc");
++	if (ab_pci->rsc_dev && (ath11k_pci_keep_d0 || ab->wow.d0_wow))
++		device_init_wakeup(ab_pci->rsc_dev, true);
++
++	{
++		struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
++		struct device *ctrl_dev = bridge ? bridge->dev.parent : NULL;
++
++		if (ctrl_dev) {
++			struct gpio_desc *gd;
++
++			gd = fwnode_gpiod_get_index(dev_fwnode(ctrl_dev), "wake",
++						    0, GPIOD_IN, "ath11k_pewake");
++			if (!IS_ERR(gd)) {
++				int pirq = gpiod_to_irq(gd);
++
++				if (pirq > 0 &&
++				    request_irq(pirq, ath11k_pci_pewake_irq_handler,
++						IRQF_TRIGGER_FALLING |
++						IRQF_NO_SUSPEND,
++						"ath11k_pewake", ab) == 0) {
++					ab->wow.pewake_gpio = gd;
++					ab->wow.pewake_irq = pirq;
++				} else {
++					gpiod_put(gd);
++				}
++			}
++		}
++	}
++
++	ath11k_info(ab, "pewake irq=%d gpio_val=%d d0_wow=%d keep_d0=%d wake_irq=%d\n",
++		    ab->wow.pewake_irq,
++		    ab->wow.pewake_gpio ? gpiod_get_value(ab->wow.pewake_gpio) : -1,
++		    ab->wow.d0_wow, ath11k_pci_keep_d0, ab->wow.wake_irq);
++
+ 	ret = ath11k_core_init(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to init core: %d\n", ret);
+@@ -1146,6 +1236,7 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 	return 0;
+ 
+ err_free_irq:
++	ath11k_pci_free_wakeup_resources(ab_pci);
+ 	/* __free_irq() expects the caller to have cleared the affinity hint */
+ 	ath11k_pci_set_irq_affinity_hint(ab_pci, NULL);
+ 	ath11k_pcic_free_irq(ab);
+@@ -1199,6 +1290,7 @@ static void ath11k_pci_remove(struct pci_dev *pdev)
+ 	ath11k_fw_destroy(ab);
+ 	ath11k_mhi_unregister(ab_pci);
+ 
++	ath11k_pci_free_wakeup_resources(ab_pci);
+ 	ath11k_pcic_free_irq(ab);
+ 	ath11k_pci_free_msi(ab_pci);
+ 	ath11k_pci_free_region(ab_pci);
+@@ -1225,9 +1317,26 @@ static void ath11k_pci_shutdown(struct pci_dev *pdev)
+ 	ath11k_pci_power_down(ab, false);
+ }
+ 
++static __maybe_unused int ath11k_pci_pm_prepare(struct device *dev)
++{
++	struct ath11k_base *ab = dev_get_drvdata(dev);
++	struct pci_dev *pdev = to_pci_dev(dev);
++
++	if (ab && !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags))
++		ab->wow.d0_wow = READ_ONCE(ath11k_pci_d0_wow);
++
++	if (pdev->bus && pdev->bus->self &&
++	    device_can_wakeup(&pdev->bus->self->dev))
++		device_set_wakeup_enable(&pdev->bus->self->dev, true);
++
++	return 0;
++}
++
+ static __maybe_unused int ath11k_pci_pm_suspend(struct device *dev)
+ {
+ 	struct ath11k_base *ab = dev_get_drvdata(dev);
++	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
++	struct pci_dev *pdev = to_pci_dev(dev);
+ 	int ret;
+ 
+ 	if (test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
+@@ -1235,9 +1344,32 @@ static __maybe_unused int ath11k_pci_pm_suspend(struct device *dev)
+ 		return 0;
+ 	}
+ 
++	ab->wow.d0_wow = READ_ONCE(ath11k_pci_d0_wow);
++
++	if (ab_pci->rsc_dev && (ab->wow.d0_wow || ath11k_pci_keep_d0))
++		device_set_wakeup_enable(ab_pci->rsc_dev, true);
++
++	if (!ab->wow.d0_wow && ath11k_pci_keep_d0) {
++		if (pdev->bus && pdev->bus->self &&
++		    device_can_wakeup(&pdev->bus->self->dev))
++			device_set_wakeup_enable(&pdev->bus->self->dev, true);
++		if (pci_enable_wake(pdev, PCI_D0, true))
++			pci_pme_active(pdev, true);
++	}
++
+ 	ret = ath11k_core_suspend(ab);
+-	if (ret)
++	if (ret) {
+ 		ath11k_warn(ab, "failed to suspend core: %d\n", ret);
++		if (!ab->wow.d0_wow && ath11k_pci_keep_d0)
++			pci_enable_wake(pdev, PCI_D0, false);
++	} else if (ab->wow.d0_wow) {
++		pci_pme_active(pdev, false);
++		pci_save_state(pdev);
++	} else if (ath11k_pci_keep_d0 && ab->wow.wake_irq_enabled) {
++		pci_save_state(pdev);
++	} else if (ath11k_pci_keep_d0) {
++		pci_enable_wake(pdev, PCI_D0, false);
++	}
+ 
+ 	return 0;
+ }
+@@ -1252,6 +1384,8 @@ static __maybe_unused int ath11k_pci_pm_resume(struct device *dev)
+ 		return 0;
+ 	}
+ 
++	if (ab->wow.d0_wow || ath11k_pci_keep_d0)
++		pci_enable_wake(to_pci_dev(dev), PCI_D0, false);
+ 	ret = ath11k_core_resume(ab);
+ 	if (ret)
+ 		ath11k_warn(ab, "failed to resume core: %d\n", ret);
+@@ -1287,6 +1421,9 @@ static __maybe_unused int ath11k_pci_pm_resume_early(struct device *dev)
+ }
+ 
+ static const struct dev_pm_ops __maybe_unused ath11k_pci_pm_ops = {
++#ifdef CONFIG_PM_SLEEP
++	.prepare = ath11k_pci_pm_prepare,
++#endif
+ 	SET_SYSTEM_SLEEP_PM_OPS(ath11k_pci_pm_suspend,
+ 				ath11k_pci_pm_resume)
+ 	SET_LATE_SYSTEM_SLEEP_PM_OPS(ath11k_pci_pm_suspend_late,
+diff --git a/drivers/net/wireless/ath/ath11k/pci.h b/drivers/net/wireless/ath/ath11k/pci.h
+index 1e3005a4b..42900ac2c 100644
+--- a/drivers/net/wireless/ath/ath11k/pci.h
++++ b/drivers/net/wireless/ath/ath11k/pci.h
+@@ -74,6 +74,7 @@ struct ath11k_pci {
+ 	unsigned long flags;
+ 	u16 link_ctl;
+ 	u64 dma_mask;
++	struct device *rsc_dev;
+ };
+ 
+ static inline struct ath11k_pci *ath11k_pci_priv(struct ath11k_base *ab)
+diff --git a/drivers/net/wireless/ath/ath11k/pcic.c b/drivers/net/wireless/ath/ath11k/pcic.c
+index 2259adc3b..fbeae1ff6 100644
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/export.h>
++#include <linux/device.h>
+ #include "core.h"
+ #include "pcic.h"
+ #include "debug.h"
+@@ -344,6 +345,12 @@ void ath11k_pcic_free_irq(struct ath11k_base *ab)
+ 	}
+ 
+ 	ath11k_pcic_free_ext_irq(ab);
++
++	if (ab->wow.wake_irq > 0) {
++		ath11k_pcic_wow_wake_irq_disable(ab);
++		free_irq(ab->wow.wake_irq, ab);
++		ab->wow.wake_irq = 0;
++	}
+ }
+ EXPORT_SYMBOL(ath11k_pcic_free_irq);
+ 
+@@ -418,8 +425,18 @@ static irqreturn_t ath11k_pcic_ce_interrupt_handler(int irq, void *arg)
+ 	struct ath11k_base *ab = ce_pipe->ab;
+ 	int irq_idx = ATH11K_PCI_IRQ_CE0_OFFSET + ce_pipe->pipe_num;
+ 
+-	if (!test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags))
++	if (!test_bit(ATH11K_FLAG_CE_IRQ_ENABLED, &ab->dev_flags)) {
++		if (READ_ONCE(ab->wow.wake_irq_enabled) &&
++		    test_bit(ce_pipe->pipe_num, &ab->wow.ce_wake_armed)) {
++			if (!test_and_set_bit(ce_pipe->pipe_num,
++					      &ab->wow.ce_wake_masked))
++				disable_irq_nosync(irq);
++			ath11k_info(ab, "ce wake irq %d (pipe %d) triggered system wakeup\n",
++				    irq, ce_pipe->pipe_num);
++			pm_wakeup_dev_event(ab->dev, 0, true);
++		}
+ 		return IRQ_HANDLED;
++	}
+ 
+ 	/* last interrupt received for this CE */
+ 	ce_pipe->timestamp = jiffies;
+@@ -658,6 +675,105 @@ static int ath11k_pcic_ext_irq_config(struct ath11k_base *ab)
+ 	return ret;
+ }
+ 
++static irqreturn_t ath11k_pcic_wake_interrupt_handler(int irq, void *arg)
++{
++	struct ath11k_base *ab = arg;
++
++	ath11k_info(ab, "wake msi irq %d triggered system wakeup\n", irq);
++	pm_wakeup_dev_event(ab->dev, 0, true);
++
++	return IRQ_HANDLED;
++}
++
++void ath11k_pcic_wow_wake_irq_enable(struct ath11k_base *ab)
++{
++	int pipe;
++
++	if (ab->wow.wake_irq_enabled)
++		return;
++
++	WRITE_ONCE(ab->wow.wake_irq_enabled, true);
++
++	if (ab->wow.d0_wow &&
++	    test_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags)) {
++		for (pipe = 1; pipe <= 2; pipe++) {
++			int irq = ab->irq_num[ATH11K_PCI_IRQ_CE0_OFFSET + pipe];
++
++			if (irq <= 0)
++				continue;
++			clear_bit(pipe, &ab->wow.ce_wake_masked);
++			set_bit(pipe, &ab->wow.ce_wake_armed);
++			smp_mb__after_atomic();
++			if (enable_irq_wake(irq) == 0)
++				set_bit(pipe, &ab->wow.ce_wake_irq_wake_mask);
++			enable_irq(irq);
++		}
++	}
++
++	if (ab->wow.pewake_irq > 0) {
++		ab->wow.pewake_irq_wake_enabled =
++			(enable_irq_wake(ab->wow.pewake_irq) == 0);
++	}
++
++	if (ab->wow.wake_irq > 0) {
++		enable_irq(ab->wow.wake_irq);
++		ab->wow.wake_irq_wake_enabled =
++			(enable_irq_wake(ab->wow.wake_irq) == 0);
++	}
++}
++EXPORT_SYMBOL(ath11k_pcic_wow_wake_irq_enable);
++
++void ath11k_pcic_wow_wake_irq_disable(struct ath11k_base *ab)
++{
++	int pipe;
++
++	if (!ab->wow.wake_irq_enabled)
++		return;
++
++	WRITE_ONCE(ab->wow.wake_irq_enabled, false);
++
++	if (ab->wow.pewake_irq > 0 && ab->wow.pewake_irq_wake_enabled) {
++		disable_irq_wake(ab->wow.pewake_irq);
++		ab->wow.pewake_irq_wake_enabled = false;
++	}
++
++	if (ab->wow.wake_irq > 0) {
++		if (ab->wow.wake_irq_wake_enabled) {
++			disable_irq_wake(ab->wow.wake_irq);
++			ab->wow.wake_irq_wake_enabled = false;
++		}
++		disable_irq_nosync(ab->wow.wake_irq);
++	}
++
++	if (ab->wow.d0_wow) {
++		for (pipe = 1; pipe <= 2; pipe++) {
++			int irq = ab->irq_num[ATH11K_PCI_IRQ_CE0_OFFSET + pipe];
++
++			if (irq <= 0)
++				continue;
++			if (test_and_clear_bit(pipe, &ab->wow.ce_wake_armed)) {
++				smp_mb__after_atomic();
++				if (!test_and_set_bit(pipe, &ab->wow.ce_wake_masked))
++					disable_irq_nosync(irq);
++				synchronize_irq(irq);
++				clear_bit(pipe, &ab->wow.ce_wake_masked);
++			}
++			if (test_and_clear_bit(pipe, &ab->wow.ce_wake_irq_wake_mask))
++				disable_irq_wake(irq);
++		}
++	}
++}
++EXPORT_SYMBOL(ath11k_pcic_wow_wake_irq_disable);
++
++void ath11k_pcic_wow_ce_service(struct ath11k_base *ab)
++{
++	local_bh_disable();
++	ath11k_ce_per_engine_service(ab, 1);
++	ath11k_ce_per_engine_service(ab, 2);
++	local_bh_enable();
++}
++EXPORT_SYMBOL(ath11k_pcic_wow_ce_service);
++
+ int ath11k_pcic_config_irq(struct ath11k_base *ab)
+ {
+ 	struct ath11k_ce_pipe *ce_pipe;
+@@ -693,8 +809,16 @@ int ath11k_pcic_config_irq(struct ath11k_base *ab)
+ 
+ 		tasklet_setup(&ce_pipe->intr_tq, ath11k_pcic_ce_tasklet);
+ 
+-		ret = request_irq(irq, ath11k_pcic_ce_interrupt_handler,
+-				  irq_flags, irq_name[irq_idx], ce_pipe);
++		{
++			unsigned long ce_irq_flags = irq_flags;
++
++			if ((i == 1 || i == 2) &&
++			    test_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags))
++				ce_irq_flags |= IRQF_NO_SUSPEND;
++
++			ret = request_irq(irq, ath11k_pcic_ce_interrupt_handler,
++					  ce_irq_flags, irq_name[irq_idx], ce_pipe);
++		}
+ 		if (ret) {
+ 			ath11k_err(ab, "failed to request irq %d: %d\n",
+ 				   irq_idx, ret);
+@@ -711,6 +835,30 @@ int ath11k_pcic_config_irq(struct ath11k_base *ab)
+ 	if (ret)
+ 		return ret;
+ 
++	if (ath11k_pcic_get_user_msi_assignment(ab, "WAKE", &msi_data_count,
++						&msi_data_start,
++						&msi_irq_start) == 0) {
++		unsigned long wake_flags = IRQF_NO_SUSPEND | IRQF_NO_AUTOEN;
++
++		if (!test_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags))
++			wake_flags |= IRQF_SHARED | IRQF_NOBALANCING;
++
++		msi_data = test_bit(ATH11K_FLAG_MULTI_MSI_VECTORS, &ab->dev_flags) ?
++			   msi_irq_start : 0;
++		irq = ath11k_pcic_get_msi_irq(ab, msi_data);
++		if (irq > 0) {
++			ret = request_irq(irq, ath11k_pcic_wake_interrupt_handler,
++					  wake_flags, "ath11k_wake", ab);
++			if (ret) {
++				ath11k_warn(ab, "failed to request WAKE irq %d: %d\n",
++					    irq, ret);
++			} else {
++				ab->wow.wake_irq = irq;
++				ab->wow.wake_irq_enabled = false;
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ath11k_pcic_config_irq);
+diff --git a/drivers/net/wireless/ath/ath11k/pcic.h b/drivers/net/wireless/ath/ath11k/pcic.h
+index 7a654a6ef..ed11cba86 100644
+--- a/drivers/net/wireless/ath/ath11k/pcic.h
++++ b/drivers/net/wireless/ath/ath11k/pcic.h
+@@ -36,6 +36,9 @@ void ath11k_pcic_get_msi_address(struct ath11k_base *ab, u32 *msi_addr_lo,
+ void ath11k_pcic_get_ce_msi_idx(struct ath11k_base *ab, u32 ce_id, u32 *msi_idx);
+ void ath11k_pcic_free_irq(struct ath11k_base *ab);
+ int ath11k_pcic_config_irq(struct ath11k_base *ab);
++void ath11k_pcic_wow_wake_irq_enable(struct ath11k_base *ab);
++void ath11k_pcic_wow_wake_irq_disable(struct ath11k_base *ab);
++void ath11k_pcic_wow_ce_service(struct ath11k_base *ab);
+ void ath11k_pcic_ext_irq_enable(struct ath11k_base *ab);
+ void ath11k_pcic_ext_irq_disable(struct ath11k_base *ab);
+ void ath11k_pcic_stop(struct ath11k_base *ab);
+diff --git a/drivers/net/wireless/ath/ath11k/qmi.c b/drivers/net/wireless/ath/ath11k/qmi.c
+index 7dc07339b..74ebe2ae3 100644
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -11,6 +11,7 @@
+ #include "core.h"
+ #include "debug.h"
+ #include "hif.h"
++#include "pcic.h"
+ #include <linux/of.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/ioport.h>
+@@ -1758,6 +1759,18 @@ int ath11k_qmi_host_cap_send(struct ath11k_base *ab)
+ 
+ 	req.nm_modem |= PLATFORM_CAP_PCIE_PME_D3COLD;
+ 
++	if (ab->wow.wake_irq > 0) {
++		int num_vectors = 0;
++		u32 user_base_data = 0, base_vector = 0;
++
++		if (ath11k_pcic_get_user_msi_assignment(ab, "WAKE", &num_vectors,
++							&user_base_data,
++							&base_vector) == 0) {
++			req.wake_msi_valid = 1;
++			req.wake_msi = user_base_data;
++		}
++	}
++
+ 	ath11k_dbg(ab, ATH11K_DBG_QMI, "host cap request\n");
+ 
+ 	ret = qmi_txn_init(&ab->qmi.handle, &txn,
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index bbca275a8..29cc320a4 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -9389,6 +9389,14 @@ int ath11k_wmi_wow_host_wakeup_ind(struct ath11k *ar)
+ 	return ret;
+ }
+ 
++static int ath11k_wow_flags_override = -1;
++module_param_named(wow_flags, ath11k_wow_flags_override, int, 0644);
++MODULE_PARM_DESC(wow_flags, "Override WMI_WOW_ENABLE flags (-1 = auto)");
++
++static int ath11k_wow_pause_iface_override = -1;
++module_param_named(wow_pause_iface, ath11k_wow_pause_iface_override, int, 0644);
++MODULE_PARM_DESC(wow_pause_iface, "Override WMI_WOW_ENABLE pause_iface (-1 = auto/enabled)");
++
+ int ath11k_wmi_wow_enable(struct ath11k *ar)
+ {
+ 	struct wmi_wow_enable_cmd *cmd;
+@@ -9405,8 +9413,22 @@ int ath11k_wmi_wow_enable(struct ath11k *ar)
+ 			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+ 
+ 	cmd->enable = 1;
+-	cmd->pause_iface_config = WOW_IFACE_PAUSE_ENABLED;
+-	ath11k_dbg(ar->ab, ATH11K_DBG_WMI, "tlv wow enable\n");
++	if (ar->ab->wow.d0_wow) {
++		cmd->pause_iface_config = WOW_IFACE_PAUSE_DISABLED;
++		cmd->flags = WMI_WOW_FLAG_DO_HTC_WAKEUP |
++			     WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW;
++	} else {
++		cmd->pause_iface_config = WOW_IFACE_PAUSE_ENABLED;
++		cmd->flags = WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW;
++	}
++	if (ath11k_wow_pause_iface_override >= 0)
++		cmd->pause_iface_config = (u32)ath11k_wow_pause_iface_override;
++	if (ath11k_wow_flags_override >= 0)
++		cmd->flags = (u32)ath11k_wow_flags_override;
++
++	ath11k_info(ar->ab,
++		    "tlv wow enable pause_iface=%u flags=0x%x\n",
++		    cmd->pause_iface_config, cmd->flags);
+ 
+ 	ret = ath11k_wmi_cmd_send(ar->wmi, skb, WMI_WOW_ENABLE_CMDID);
+ 	if (ret) {
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
+index b2dade051..f485cf4f9 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -5916,6 +5916,15 @@ enum wmi_wow_interface_cfg {
+ 	WOW_IFACE_PAUSE_DISABLED
+ };
+ 
++enum wmi_wow_flag {
++	WMI_WOW_FLAG_IGNORE_PCIE_RESET		= BIT(0),
++	WMI_WOW_FLAG_SEND_PM_PME		= BIT(1),
++	WMI_WOW_FLAG_UNIT_TEST_ENABLE		= BIT(2),
++	WMI_WOW_FLAG_DO_HTC_WAKEUP		= BIT(3),
++	WMI_WOW_FLAG_ENABLE_DRV_PCIE_L1SS_SLEEP	= BIT(4),
++	WMI_WOW_FLAG_SYSTEM_SUSPEND_WOW		= BIT(5),
++};
++
+ #define C2S(x) case x: return #x
+ 
+ static inline const char *wow_wakeup_event(enum wmi_wow_wakeup_event ev)
+diff --git a/drivers/net/wireless/ath/ath11k/wow.c b/drivers/net/wireless/ath/ath11k/wow.c
+index d6c272590..5d9415431 100644
+--- a/drivers/net/wireless/ath/ath11k/wow.c
++++ b/drivers/net/wireless/ath/ath11k/wow.c
+@@ -15,9 +15,11 @@
+ #include "wmi.h"
+ #include "wow.h"
+ #include "dp_rx.h"
++#include "pcic.h"
+ 
+ static const struct wiphy_wowlan_support ath11k_wowlan_support = {
+-	.flags = WIPHY_WOWLAN_DISCONNECT |
++	.flags = WIPHY_WOWLAN_ANY |
++		 WIPHY_WOWLAN_DISCONNECT |
+ 		 WIPHY_WOWLAN_MAGIC_PKT |
+ 		 WIPHY_WOWLAN_SUPPORTS_GTK_REKEY |
+ 		 WIPHY_WOWLAN_GTK_REKEY_FAILURE,
+@@ -367,6 +369,11 @@ static int ath11k_vif_wow_set_wakeups(struct ath11k_vif *arvif,
+ 		__set_bit(WOW_RA_MATCH_EVENT, &wow_mask);
+ 		break;
+ 	case WMI_VDEV_TYPE_STA:
++		if (wowlan->any || wowlan->n_patterns) {
++			__set_bit(WOW_HTT_EVENT, &wow_mask);
++			__set_bit(WOW_RA_MATCH_EVENT, &wow_mask);
++		}
++
+ 		if (wowlan->disconnect) {
+ 			__set_bit(WOW_DEAUTH_RECVD_EVENT, &wow_mask);
+ 			__set_bit(WOW_DISASSOC_RECVD_EVENT, &wow_mask);
+@@ -693,32 +700,32 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
+ 		goto exit;
+ 	}
+ 
+-	ret =  ath11k_wow_cleanup(ar);
++	ret = ath11k_wow_cleanup(ar);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to clear wow wakeup events: %d\n",
+ 			    ret);
+-		goto exit;
++		goto err_pktlog_start;
+ 	}
+ 
+ 	ret = ath11k_wow_set_wakeups(ar, wowlan);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to set wow wakeup events: %d\n",
+ 			    ret);
+-		goto cleanup;
++		goto err_wow_cleanup;
+ 	}
+ 
+ 	ret = ath11k_wow_protocol_offload(ar, true);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to set wow protocol offload events: %d\n",
+ 			    ret);
+-		goto cleanup;
++		goto err_wow_cleanup;
+ 	}
+ 
+ 	ret = ath11k_wow_set_hw_filter(ar);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to set hw filter: %d\n",
+ 			    ret);
+-		goto cleanup;
++		goto err_protocol_offload;
+ 	}
+ 
+ 	ret = ath11k_wow_set_keepalive(ar,
+@@ -726,13 +733,13 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
+ 				       WMI_STA_KEEPALIVE_INTERVAL_DEFAULT);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to enable wow keepalive: %d\n", ret);
+-		goto cleanup;
++		goto err_hw_filter;
+ 	}
+ 
+ 	ret = ath11k_wow_enable(ar->ab);
+ 	if (ret) {
+ 		ath11k_warn(ar->ab, "failed to start wow: %d\n", ret);
+-		goto cleanup;
++		goto err_keepalive;
+ 	}
+ 
+ 	ret = ath11k_dp_rx_pktlog_stop(ar->ab, false);
+@@ -740,32 +747,48 @@ int ath11k_wow_op_suspend(struct ieee80211_hw *hw,
+ 		ath11k_warn(ar->ab,
+ 			    "failed to stop dp rx pktlog during wow suspend: %d\n",
+ 			    ret);
+-		goto cleanup;
++		goto err_wow_wakeup;
+ 	}
+ 
+ 	ath11k_ce_stop_shadow_timers(ar->ab);
+ 	ath11k_dp_stop_shadow_timers(ar->ab);
+ 
++	if (wowlan && !device_may_wakeup(ar->ab->dev))
++		ath11k_warn(ar->ab, "wowlan suspend requested while device_may_wakeup is false\n");
++
+ 	ath11k_hif_irq_disable(ar->ab);
+ 	ath11k_hif_ce_irq_disable(ar->ab);
+ 
+-	ret = ath11k_hif_suspend(ar->ab);
+-	if (ret) {
+-		ath11k_warn(ar->ab, "failed to suspend hif: %d\n", ret);
+-		goto wakeup;
++	if (!ar->ab->wow.d0_wow) {
++		ret = ath11k_hif_suspend(ar->ab);
++		if (ret) {
++			ath11k_warn(ar->ab, "failed to suspend hif: %d\n", ret);
++			ath11k_hif_ce_irq_enable(ar->ab);
++			ath11k_hif_irq_enable(ar->ab);
++			goto err_wow_wakeup;
++		}
+ 	}
+ 
++	ath11k_pcic_wow_wake_irq_enable(ar->ab);
++
+ 	goto exit;
+ 
+-wakeup:
++err_wow_wakeup:
+ 	ath11k_wow_wakeup(ar->ab);
+-
+-cleanup:
++err_keepalive:
++	ath11k_wow_set_keepalive(ar, WMI_STA_KEEPALIVE_METHOD_NULL_FRAME,
++				 WMI_STA_KEEPALIVE_INTERVAL_DISABLE);
++err_hw_filter:
++	ath11k_wow_clear_hw_filter(ar);
++err_protocol_offload:
++	ath11k_wow_protocol_offload(ar, false);
++err_wow_cleanup:
+ 	ath11k_wow_cleanup(ar);
+-
++err_pktlog_start:
++	ath11k_dp_rx_pktlog_start(ar->ab);
+ exit:
+ 	mutex_unlock(&ar->conf_mutex);
+-	return ret ? 1 : 0;
++	return ret ? -EBUSY : 0;
+ }
+ 
+ void ath11k_wow_op_set_wakeup(struct ieee80211_hw *hw, bool enabled)
+@@ -784,13 +807,19 @@ int ath11k_wow_op_resume(struct ieee80211_hw *hw)
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 
+-	ret = ath11k_hif_resume(ar->ab);
+-	if (ret) {
+-		ath11k_warn(ar->ab, "failed to resume hif: %d\n", ret);
+-		goto exit;
++	ath11k_pcic_wow_wake_irq_disable(ar->ab);
++
++	if (!ar->ab->wow.d0_wow) {
++		ret = ath11k_hif_resume(ar->ab);
++		if (ret) {
++			ath11k_warn(ar->ab, "failed to resume hif: %d\n", ret);
++			goto exit;
++		}
+ 	}
+ 
+ 	ath11k_hif_ce_irq_enable(ar->ab);
++	if (ar->ab->wow.d0_wow)
++		ath11k_pcic_wow_ce_service(ar->ab);
+ 	ath11k_hif_irq_enable(ar->ab);
+ 
+ 	ret = ath11k_dp_rx_pktlog_start(ar->ab);
+diff --git a/drivers/net/wireless/ath/ath11k/wow.h b/drivers/net/wireless/ath/ath11k/wow.h
+index 13dbcfec9..a6a8f150b 100644
+--- a/drivers/net/wireless/ath/ath11k/wow.h
++++ b/drivers/net/wireless/ath/ath11k/wow.h
+@@ -21,7 +21,7 @@ struct rfc1042_hdr {
+ 	__be16 snap_type;
+ } __packed;
+ 
+-#define ATH11K_WOW_RETRY_NUM		3
++#define ATH11K_WOW_RETRY_NUM		10
+ #define ATH11K_WOW_RETRY_WAIT_MS	200
+ #define ATH11K_WOW_PATTERNS		22
+ 
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index b58a607b7..647ec2970 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -19,6 +19,7 @@
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
+ #include <linux/limits.h>
++#include <linux/moduleparam.h>
+ #include <linux/init.h>
+ #include <linux/of.h>
+ #include <linux/of_pci.h>
+@@ -41,6 +42,11 @@
+ #include "pcie-designware.h"
+ #include "pcie-qcom-common.h"
+ 
++static bool keep_min_opp_s2idle = true;
++module_param(keep_min_opp_s2idle, bool, 0644);
++MODULE_PARM_DESC(keep_min_opp_s2idle,
++		 "Keep minimum PCIe OPP instead of clearing OPP during non-S2RAM s2idle");
++
+ /* PARF registers */
+ #define PARF_SYS_CTRL				0x00
+ #define PARF_PM_CTRL				0x20
+@@ -1744,6 +1750,22 @@ static void qcom_pcie_icc_opp_update(struct qcom_pcie *pcie)
+ 	}
+ }
+ 
++static int qcom_pcie_set_min_opp(struct device *dev)
++{
++	unsigned long min_freq = 0;
++	struct dev_pm_opp *opp;
++	int ret;
++
++	opp = dev_pm_opp_find_freq_ceil(dev, &min_freq);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++
++	ret = dev_pm_opp_set_opp(dev, opp);
++	dev_pm_opp_put(opp);
++
++	return ret;
++}
++
+ static int qcom_pcie_set_max_opp(struct device *dev)
+ {
+ 	unsigned long max_freq = ULONG_MAX;
+@@ -2388,8 +2410,11 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
+ 				dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n",
+ 					ret);
+ 
+-			if (pcie->use_pm_opp)
+-				dev_pm_opp_set_opp(pcie->pci->dev, NULL);
++			if (pcie->use_pm_opp) {
++				if (!keep_min_opp_s2idle ||
++				    qcom_pcie_set_min_opp(pcie->pci->dev))
++					dev_pm_opp_set_opp(pcie->pci->dev, NULL);
++			}
+ 		}
+ 	}
+ 	return ret;
+diff --git a/net/qrtr/mhi.c b/net/qrtr/mhi.c
+index e9a4bb92c..487a16e69 100644
+--- a/net/qrtr/mhi.c
++++ b/net/qrtr/mhi.c
+@@ -14,6 +14,7 @@ struct qrtr_mhi_dev {
+ 	struct qrtr_endpoint ep;
+ 	struct mhi_device *mhi_dev;
+ 	struct device *dev;
++	bool suspended_unprepared;
+ };
+ 
+ /* From MHI to QRTR */
+@@ -165,17 +166,25 @@ MODULE_DEVICE_TABLE(mhi, qcom_mhi_qrtr_id_table);
+ static int __maybe_unused qcom_mhi_qrtr_pm_suspend_late(struct device *dev)
+ {
+ 	struct mhi_device *mhi_dev = container_of(dev, struct mhi_device, dev);
++	struct qrtr_mhi_dev *qdev = dev_get_drvdata(dev);
+ 	enum mhi_state state;
+ 
+ 	state = mhi_get_mhi_state(mhi_dev->mhi_cntrl);
+ 	/*
+-	 * If the device is in suspend state, then no need for the
+-	 * client driver to unprepare the channels.
++	 * If the device is in suspend state (M3), or kept active in M0/M2
++	 * for D0-WoW wakeup on a wakeup-capable controller, skip tearing down
++	 * the IPCR channels.
+ 	 */
+-	if (state == MHI_STATE_M3)
++	if (state == MHI_STATE_M3 ||
++	    (mhi_dev->mhi_cntrl->cntrl_dev &&
++	     device_may_wakeup(mhi_dev->mhi_cntrl->cntrl_dev) &&
++	     (state == MHI_STATE_M0 || state == MHI_STATE_M2))) {
++		qdev->suspended_unprepared = false;
+ 		return 0;
++	}
+ 
+ 	mhi_unprepare_from_transfer(mhi_dev);
++	qdev->suspended_unprepared = true;
+ 
+ 	return 0;
+ }
+@@ -187,14 +196,19 @@ static int __maybe_unused qcom_mhi_qrtr_pm_resume_early(struct device *dev)
+ 	enum mhi_state state;
+ 	int rc;
+ 
++	if (!qdev->suspended_unprepared)
++		return 0;
++
+ 	state = mhi_get_mhi_state(mhi_dev->mhi_cntrl);
+ 	/*
+ 	 * If the device is in suspend state, we won't unprepare channels
+ 	 * in suspend callback, therefore no need to prepare channels when
+ 	 * resume.
+ 	 */
+-	if (state == MHI_STATE_M3)
++	if (state == MHI_STATE_M3) {
++		qdev->suspended_unprepared = false;
+ 		return 0;
++	}
+ 
+ 	rc = mhi_prepare_for_transfer(mhi_dev);
+ 	if (rc) {
+@@ -206,6 +220,7 @@ static int __maybe_unused qcom_mhi_qrtr_pm_resume_early(struct device *dev)
+ 	if (rc)
+ 		return rc;
+ 
++	qdev->suspended_unprepared = false;
+ 	qrtr_endpoint_hello(&qdev->ep);
+ 
+ 	return 0;

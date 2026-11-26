@@ -1,10 +1,10 @@
 # 一加 Ace Pro (PGP110 / ovaltine) 主线 Linux 移植完整工程指导手册
 
-> **文档版本**：v2.7 (P3.14 里程碑归档：`qcom_battmgr` 异步 OEM 缓存消除 450ms sysfs 阻塞，恢复 `lxc-webui` 功率显示)  
-> **更新时间**：2026-11-24  
+> **文档版本**：v2.8 (P3.15 里程碑归档：`s2idle` Connected Standby 下保持 Wi-Fi 连接与来包自动唤醒)  
+> **更新时间**：2026-11-27  
 > **目标系统**：Ubuntu Desktop / Phosh Mobile Linux (Linux 7.3.0-rc4 mainline)  
 > **目标机型**：一加 Ace Pro (OnePlus Ace Pro / PGP110 / 内部代号 `ovaltine` / 项目代号 `21841`)  
-> **当前实机运行版本**：**P3.14 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.14 `qcom_battmgr.ko`，默认 `mem_sleep=deep`、GPU/GMU `power/control=auto`、Wi-Fi 静态 IP `<STATIC_IP>/24`、未插电熄屏 180s 自动 `deep` 休眠、电池 sysfs 读取耗时 `0.03~33ms`，实机验证 `boot_id`: `79be0688-0b00-4dd2-b2b7-6327a8dda132`；归档路径：[development/milestones/P3_14/](file://<WORKSPACE>/development/milestones/P3_14/)）
+> **当前实机运行版本**：**P3.15 基线**（`7.3.0-rc4-ovaltine-p3-7-ufs1` 内核 `p3_15_boot.img` + R3 `vendor_boot_a` DTB + R1+R2 `msm.ko` + P3.10 `synaptics_tcm.ko` + P3.14 `qcom_battmgr.ko` + P3.15 `ath11k.ko`/`ath11k_pci.ko`/`qrtr-mhi.ko`，支持黑屏 `s2idle` Connected Standby、来包经 `PCIe PME (IRQ 184)` 自动唤醒且不影响 `qcom_battmgr` / `lxc-webui` / Stage 1 功耗策略，实机验证 `boot_id`: `5ee0f715-22f6-4e66-9214-cc75628c4fd7`；归档路径：[development/milestones/P3_15/](file://<WORKSPACE>/development/milestones/P3_15/)）
 
 ---
 
@@ -394,6 +394,21 @@ P3.8 围绕 **R3（USB HS-only）** 与 **R1（显示 DSI PHY AHB `prepare` 生�
   1. 引入 `oem_read_work`（`devm_work_autocancel` 托管）与 `oem_last_update`：在 `qcom_battmgr_enable_worker()` 初始化时先拉取一次填满 `oem_read_buf`，后续在 `bat_sm8350_update()` 中当缓存超过 `2000 ms` 时异步 `schedule_work(&battmgr->oem_read_work)` 后台刷新，移除 sysfs 同步读路径上的 450ms 等待。
   2. 新增 `qcom_battmgr_prop_from_oem()`：当 `oem_read_buf_valid` 为真时，对由 `oem_read_buf` 提供的属性（`VOLTAGE_NOW`、`CAPACITY`、`TEMP`、`CYCLE_COUNT`、`CHARGE_FULL`、`CHARGE_COUNTER`、`STATE_OF_HEALTH` 及 `!usb.online` 下的 `CURRENT_NOW`）直接走内存缓存，跳过冗余 `BATTMGR_BAT_PROPERTY_GET`。
 * **实机验收 (`boot_id`: `79be0688-0b00-4dd2-b2b7-6327a8dda132`)**：部署 `qcom_battmgr.ko` (`126d536b...11d4`) 后，`qcom-battmgr-bat` 实测单次读取耗时降至 `type=0.10ms`、`status=2.47ms`、`voltage_now=0.06ms`、`current_now=33.02ms`、`capacity=0.04ms`、`charge_full=0.03ms`、`charge_full_design=0.39ms`、`charge_counter=0.05ms`，`qcom-battmgr-usb` `online=32.41ms`、`voltage_now=3.78ms`、`current_now=5.95ms`（全部 **`< 50 ms`**，远低于 `lxc-webui` 300ms 阈值，实测输入功率 `9.362 W`、电池充电功率 `2.062 W`）；`thermal_zone0=44.0°C`、`thermal_zone1=46.7°C`，`vmstat` 稳态 `99% idle`，`UPOWER_NAN_COUNT=0`。
+
+### 10.0-E P3.15 `s2idle` Connected Standby（黑屏保活 Wi-Fi 与来包自动唤醒，`TASK-20261125-001500`, `PASS`)
+* **根因定位**：
+  1. GICv3-ITS (`irq-gic-v3-its.c`、`irq-gic-its-msi-parent.c`) 缺少 `IRQCHIP_SKIP_SET_WAKE`，导致 PCIe Root Port `PCIe PME (IRQ 184)` 与 `ath11k_wake` 的 `enable_irq_wake()` 失败。
+  2. SM8450/SM8475 PCIe 使用 OPP 表（`pcie->use_pm_opp=true`），`qcom_pcie_suspend_noirq()` 在非 S2RAM `s2idle` 下即便 `!pcie->pci->suspended`（链路保持激活）也无条件调用 `dev_pm_opp_set_opp(dev, NULL)`，撤除了 `pcie_noc -> mc_virt` 互联与 `rpmhpd` 最低电压档位，阻塞 EP 上行唤醒报文/MSI。
+  3. `ath11k` 在 `D0-WoW` 下通过 HTC wakeup 上报无法穿透，而在 `D3hot + MHI M3` (`d0_wow=false, keep_d0=false`, `pause_iface=0, flags=0x20`) 配合 Root Port `00:00.0` `power/wakeup=enabled` 时，WCN6855 匹配 WoWLAN 规则后触发 `PCIe PME (IRQ 184)` 稳定唤醒全核。
+  4. 遇到固件瞬时忙应答 `ATH11K_HTC_MSG_NACK_SUSPEND` 时，原 `ath11k_wow_op_suspend()` 仅重试 3 次并返回正值 `1`，触发 `cfg80211_leave_all()` 主动 `DEAUTH_LEAVING` 断网并下电 MHI 导致恢复超时 `-110`。
+* **修复方案（[development/milestones/P3_15/](file://<WORKSPACE>/development/milestones/P3_15/)，`0010-p3_15-ath11k-wowlan-pcie-pme-s2idle.patch`）**：
+  1. **`irqchip`**：在 GICv3-ITS / ITS MSI parent 添加 `IRQCHIP_SKIP_SET_WAKE`，允许 `enable_irq_wake(184)` 成功武装。
+  2. **`pcie-qcom.c` (`Image.gz`)**：新增 `qcom_pcie_set_min_opp()` 与默认 `keep_min_opp_s2idle=true`，在 `!pcie->pci->suspended` 的非 S2RAM `s2idle` 中维持最低 PCIe OPP。
+  3. **`ath11k` (`ath11k.ko`, `ath11k_pci.ko`) & `qrtr-mhi.ko`**：默认 `d0_wow=false, keep_d0=false`、`probe`/`pm_prepare` 无条件使能 `00:00.0` 与 `01:00.0` `wakeup`、`ath11k_wmi_wow_enable()` 在 `!d0_wow` 下默认 `pause_iface=0, flags=0x20`；将 `ATH11K_WOW_RETRY_NUM` 由 `3` 增至 `10`，并在 `ath11k_wow_op_suspend()` 完善逆序回滚且返回 `-EBUSY`（不再返回 `1` 引发断网）。
+  4. **用户态 (`/usr/lib/systemd/system-sleep/acepro-wowlan`, `/usr/local/sbin/acepro-idle-suspend.py`)**：动态解析 `wlp1s0` 对应的 `phyX`（不再硬编码 `phy0`），避免重载模块后 WoWLAN patterns 失效。
+* **实机验收 (`boot_id`: `5ee0f715-22f6-4e66-9214-cc75628c4fd7`, `p3_15_boot.img` `23efa9cf...`)**：
+  - 冷启动零手动覆盖下完成 3 轮连续 `s2idle` 自动唤醒（C1 ~29s ping `202ms`/`0%` 丢包；C2 ~29s 免先 ping 直接 `ssh` `1225ms` 成功；C3 ~33s 连续再休眠 ping `172ms`/`0%` 丢包），`pmic_pwrkey +0`、`184 (PCIe PME)` `+1/+2/+2`、`cpu0..7 state1/s2idle/usage` `0->3`、`suspend_stats success=3, fail=0`、零 `DEAUTH_LEAVING` 与 MHI 超时。
+  - Stage 1 (`PowerSaveMode 3<->0`)、`lxc-webui :6080` (`HTTP 200`) 与 `qcom_battmgr` 缓存耗时 (`0.07–60.21 ms`) 均保持正常；回退方式为仅刷写 `P3_8/p3_8_boot.img` 到 `boot_a` 或切换 Slot `_b`。
 
 ### 10.1 P3.9-R2 已完成实机验收项 (`TASK-20261120-010302`, `PASS`)
 * **根因修复**：在 `a6xx_gmu.c` 与 `a6xx_hfi.c` 修复 `a6xx_hfi_irq()`/`a6xx_gmu_irq()` 掩码过滤与 `IRQ_NONE` 返回、`a6xx_gmu_irq_disable()`/`a6xx_gmu_resume()` posted-write readback 刷新、`a6xx_hfi_queue_read()` `dma_rmb()` 与 `a6xx_hfi_wait_for_msg_interrupt()` `rspq` 非空轮询。

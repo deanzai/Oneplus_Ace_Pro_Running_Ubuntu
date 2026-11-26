@@ -1,0 +1,36 @@
+#!/bin/sh
+configure_wowlan() {
+    if [ -d /sys/class/net/wlp1s0 ] && iw dev wlp1s0 link 2>/dev/null | grep -q 'Connected to'; then
+        CUR_PHY=$(cat /sys/class/net/wlp1s0/phy80211/name 2>/dev/null || iw dev wlp1s0 info 2>/dev/null | awk '/wiphy/{print "phy"$2}')
+        MAC=$(cat /sys/class/net/wlp1s0/address 2>/dev/null)
+        if [ -n "$CUR_PHY" ] && [ -n "$MAC" ]; then
+            iw "$CUR_PHY" wowlan enable disconnect magic-packet gtk-rekey-failure patterns "${MAC}:-:-:-:-:-:-:08:00" "${MAC}:-:-:-:-:-:-:86:dd" 2>/dev/null || true
+        fi
+    fi
+    if [ -w /sys/bus/pci/devices/0000:00:00.0/power/wakeup ]; then
+        echo enabled > /sys/bus/pci/devices/0000:00:00.0/power/wakeup 2>/dev/null || true
+    fi
+    if [ -w /sys/bus/pci/devices/0000:01:00.0/power/wakeup ]; then
+        echo enabled > /sys/bus/pci/devices/0000:01:00.0/power/wakeup 2>/dev/null || true
+    fi
+    if [ -w /sys/devices/platform/soc@0/17a00000.rsc/power/wakeup ]; then
+        echo enabled > /sys/devices/platform/soc@0/17a00000.rsc/power/wakeup 2>/dev/null || true
+    fi
+}
+pin_silver_irqs() {
+    for irq in $(grep '0000:01:00.0' /proc/interrupts 2>/dev/null | awk -F: '{gsub(/ /, "", $1); print $1}'); do
+        echo 0f > "/proc/irq/$irq/smp_affinity" 2>/dev/null || true
+    done
+    for rps in /sys/class/net/wlp1s0/queues/rx-*/rps_cpus; do
+        [ -w "$rps" ] && echo 0f > "$rps" 2>/dev/null || true
+    done
+}
+case "$1" in
+    pre)
+        configure_wowlan
+        ;;
+    post)
+        pin_silver_irqs
+        ;;
+esac
+exit 0
